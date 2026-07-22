@@ -61,6 +61,7 @@
 #include <libgsi/libgsi.h>
 #include <liblp/builder.h>
 #include <libsnapshot/snapshot.h>
+#include <private/android_filesystem_config.h> /* for AID_SYSTEM */
 #include "variables.h"
 #include "twcommon.h"
 #include "partitions.hpp"
