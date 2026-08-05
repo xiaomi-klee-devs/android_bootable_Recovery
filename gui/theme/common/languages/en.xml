@@ -1118,7 +1118,7 @@
 
 		<string name="backup_quick_info1">These partitions will be selected</string>
 		<string name="backup_quick_info2">after tapping "Quick Backup" button</string>
-		<string name="mbyte">MB</string>
+		<string name="mbyte"> MB</string>
 		<string name="mbytesec">MB/s</string>
 		<string name="kbyte"> KB</string>
 		<string name="backup_av_files">File</string>
