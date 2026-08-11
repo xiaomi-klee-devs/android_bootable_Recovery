@@ -5184,4 +5184,16 @@ void TWFunc::update_permissions_on_reboot() {
 	sync();
   }
 }
+
+bool TWFunc::Block_Operations_Until_Reboot() {
+#ifdef OF_BLOCK_OPERATIONS_AFTER_ROM_FLASH
+	if (TWFunc::Fox_Property_Get("fox_block_operations_pending_reboot") == "blocking") {
+		gui_print_color("error", "\n\nThis operation has been blocked. Reboot OrangeFox (NOW!) before doing anything else.\n\n");
+		return true;
+	}
+	return false;
+#else
+	return false;
+#endif
+}
 //

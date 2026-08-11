@@ -470,6 +470,10 @@ void GUIAction::simulate_progress_bar(void)
 
 int GUIAction::flash_zip(std::string filename, int *wipe_cache)
 {
+
+ if (TWFunc::Block_Operations_Until_Reboot())
+	return -1;
+
   int ret_val = 0;
 
   DataManager::SetValue("ui_progress", 0);

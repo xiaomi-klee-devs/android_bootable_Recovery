@@ -1952,6 +1952,8 @@ static void Update_Encryption_Props_Before_Format() {
 }
 
 int TWPartitionManager::Format_Data(void) {
+	if (TWFunc::Block_Operations_Until_Reboot())
+		return false;
 	TWPartition* dat = Find_Partition_By_Path("/data");
 	TWPartition* metadata = Find_Partition_By_Path("/metadata");
 	bool ret = false;
