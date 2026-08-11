@@ -795,6 +795,18 @@ void OpenRecoveryScript::Run_CLI_Command(const char* command) {
 				}
 			}
 		}
+	} else if (cmd_str == "console_message" || cmd_str == "console_warning" || cmd_str == "console_error") {
+		int i = cmd_str.length() + 1;
+		if (tmp.length() > i) {
+			std::string s = "warning";
+			if (cmd_str == "console_error")
+				s = "error";
+			std::string msg = tmp.substr(i);
+			if (cmd_str == "console_message")
+				gui_print("%s\n", msg.c_str());
+			else
+				gui_print_color(s.c_str(), "%s\n", msg.c_str());
+		}
 	} else if (OpenRecoveryScript::Insert_ORS_Command(command)) {
 		OpenRecoveryScript::run_script_file();
 	}
