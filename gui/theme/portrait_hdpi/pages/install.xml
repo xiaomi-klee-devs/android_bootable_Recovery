@@ -698,6 +698,15 @@
 			</text>
 
 			<button style="btn_raised">
+				<condition var1="tw_reboot_recovery" var2="1"/>
+				<placement x="%btn_raised_left_x%" y="%row_btn1_y%"/>
+				<text>{@reboot_recovery_btn}</text>
+				<action function="set">tw_back=main</action>
+				<action function="set">tw_action_param=recovery</action>
+				<action function="page">rebootcheck</action>
+			</button>
+
+			<!--button style="btn_raised">
 				<placement x="%btn_raised_left_x%" y="%row_btn1_y%"/>
 				<text>{@wipe_cache_btn}</text>
 				<action function="disableled"/>
@@ -712,7 +721,7 @@
 				<action function="set">tw_complete_text1={@wipe_cache_dalvik_complete}</action>
 				<action function="set">tw_slider_text={@swipe_wipe}</action>
 				<action function="page">confirm_action</action>
-			</button>
+			</button -->
 
 			<action>
 				<condition var1="tw_install_reboot" var2="1"/>
