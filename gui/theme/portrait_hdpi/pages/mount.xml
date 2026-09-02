@@ -105,6 +105,50 @@
 				<image resource="fab_usb"/>
 			</image>
 
+			<!-- USB OTG host mode is separate from the legacy USB-storage gadget.
+			     On rodin, touch this after connecting an OTG drive to supply VBUS. -->
+			<image>
+				<condition var1="tw_has_usb_otg" var2="1"/>
+				<condition var1="tw_usb_otg_host_active" op="!=" var2="1"/>
+				<placement x="%btn_float_x%" y="%btn_float_y%" placement="4"/>
+				<image resource="fab_shadow"/>
+			</image>
+
+			<button style="floating_btn">
+				<condition var1="tw_has_usb_otg" var2="1"/>
+				<condition var1="tw_usb_otg_host_active" op="!=" var2="1"/>
+				<placement x="%btn_float_x%" y="%btn_float_y%" placement="4"/>
+				<action function="mount">otg</action>
+			</button>
+
+			<image>
+				<condition var1="tw_has_usb_otg" var2="1"/>
+				<condition var1="tw_usb_otg_host_active" op="!=" var2="1"/>
+				<placement x="%btn_float_x%" y="%btn_float_y%" placement="4"/>
+				<image resource="fab_usb"/>
+			</image>
+
+			<image>
+				<condition var1="tw_has_usb_otg" var2="1"/>
+				<condition var1="tw_usb_otg_host_active" var2="1"/>
+				<placement x="%btn_float_x%" y="%btn_float_y%" placement="4"/>
+				<image resource="fab_shadow"/>
+			</image>
+
+			<button style="floating_btn">
+				<condition var1="tw_has_usb_otg" var2="1"/>
+				<condition var1="tw_usb_otg_host_active" var2="1"/>
+				<placement x="%btn_float_x%" y="%btn_float_y%" placement="4"/>
+				<action function="unmount">otg</action>
+			</button>
+
+			<image>
+				<condition var1="tw_has_usb_otg" var2="1"/>
+				<condition var1="tw_usb_otg_host_active" var2="1"/>
+				<placement x="%btn_float_x%" y="%btn_float_y%" placement="4"/>
+				<image resource="fab_close"/>
+			</image>
+
 			<template name="gestures"/>
 
 			<action>

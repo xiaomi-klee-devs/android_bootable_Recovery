@@ -246,6 +246,7 @@ TWPartition::TWPartition() {
 	Sysfs_Entry = "";
 	Actual_Block_Device = "";
 	Primary_Block_Device = "";
+	Logical_Partition_Name = "";
 	Alternate_Block_Device = "";
 	Removable = false;
 	Is_Present = false;
@@ -381,6 +382,8 @@ bool TWPartition::Process_Fstab_Line(const char *fstab_line, bool Display_Error,
 					LOGERR("Until we get better BML support, you will have to find and provide the full block device path to the BML devices e.g. /dev/block/bml9 instead of the partition name\n");
 			} else {
 				Primary_Block_Device = ptr;
+				if (fstab_version == 2 && *ptr != '/')
+					Logical_Partition_Name = ptr;
 				if (*ptr == '/')
 					Find_Real_Block_Device(Primary_Block_Device, Display_Error);
 			}
@@ -1807,12 +1810,27 @@ bool TWPartition::UnMount(bool Display_Error, int flags) {
 		if (!Symlink_Mount_Point.empty())
 			umount2(Symlink_Mount_Point.c_str(), flags);
 
+		errno = 0;
 		umount2(Mount_Point.c_str(), flags);
+		const int unmount_errno = errno;
 		if (Is_Mounted()) {
+			if ((Mount_Point == "/odm" || Mount_Point == "/vendor") && unmount_errno == EBUSY) {
+				(void)umount2(Mount_Point.c_str(), MNT_DETACH);
+				usleep(200000);
+				if (!Is_Mounted())
+					return true;
+				errno = unmount_errno;
+			}
 			if (Mount_Point == "/data" || Mount_Point == "/sdcard" || Mount_Point == "/data/media/0") {
 				LOGINFO("DEBUG: attempting again to unmount '%s'\n", Mount_Point.c_str());
 				TWFunc::Exec_Cmd("umount -l " + Mount_Point);
 				sleep(1);
+				if (!Is_Mounted())
+					return true;
+			} else if (Mount_Point == "/odm" || Mount_Point == "/vendor") {
+				LOGINFO("DEBUG: attempting again to unmount '%s'\n", Mount_Point.c_str());
+				TWFunc::Exec_Cmd("umount -l " + Mount_Point);
+				usleep(200000);
 				if (!Is_Mounted())
 					return true;
 			}
@@ -2705,10 +2723,24 @@ bool TWPartition::Wipe_F2FS() {
 	#endif
 
 	#ifdef OF_USE_DMCTL
-	if (TWFunc::Path_Exists("/dev/block/mapper/userdata")) {
+	if (Mount_Point == "/data" && TWFunc::Path_Exists("/dev/block/mapper/userdata")) {
 		LOGINFO("OrangeFox: running dmctl before formatting...\n");
-		TWFunc::Exec_Cmd("dmctl delete userdata", false);
-		usleep(32768);
+		if (TWFunc::Exec_Cmd("dmctl delete userdata", false) != 0) {
+			LOGERR("Unable to remove decrypted userdata mapper; refusing to format %s.\n",
+					Actual_Block_Device.c_str());
+			gui_print("Unable to release decrypted userdata; format aborted.\n");
+			return false;
+		}
+		for (unsigned int retry = 0; retry < 20 &&
+				TWFunc::Path_Exists("/dev/block/mapper/userdata"); retry++) {
+			usleep(50000);
+		}
+		if (TWFunc::Path_Exists("/dev/block/mapper/userdata")) {
+			LOGERR("Decrypted userdata mapper is still present; refusing to format %s.\n",
+					Actual_Block_Device.c_str());
+			gui_print("Decrypted userdata is still busy; format aborted.\n");
+			return false;
+		}
 	}
 	#elif defined(FOX_USE_DMSETUP)
 	if (TWFunc::Path_Exists("/dev/block/mapper/userdata")) {
@@ -3864,5 +3896,9 @@ bool TWPartition::Is_SlotSelect() {
 
 string TWPartition::Get_Mount_Point() {
 	return Mount_Point;
+}
+
+string TWPartition::Get_Logical_Partition_Name() {
+	return Logical_Partition_Name;
 }
 //* 

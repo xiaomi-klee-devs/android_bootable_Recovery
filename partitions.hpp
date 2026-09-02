@@ -182,6 +182,7 @@ public:
 	bool Is_SlotSelect();                                                     // Return whether the partition is a slot partition or not
 	bool Get_Super_Status();						  // Returns true if partition is a super volume mounted partitions
 	string Get_Mount_Point();						  // Return Mount_Point or directory the current partition is mounted on
+	string Get_Logical_Partition_Name();                                     // Return the logical name preserved from a v2 fstab entry
 	void Set_Can_Be_Backed_Up(bool val);					  // Update whether the partition can be backed up or not
 	void Set_Can_Be_Wiped(bool val);					  // Update whether the partition can be wiped or not
 
@@ -272,6 +273,7 @@ private:
 	bool Wildcard_Block_Device;                                               // If the block device contains an asterisk, we set this flag
 	string Sysfs_Entry;                                                       // For v2 fstab, if the "block device" starts with /devices then it is a sysfs entry that is handled by uevents
 	string Primary_Block_Device;                                              // Block device (e.g. /dev/block/mmcblk1p1)
+	string Logical_Partition_Name;                                           // Original bare logical name, retained after mapper setup
 	string Alternate_Block_Device;                                            // Alternate block device (e.g. /dev/block/mmcblk1)
 	string Decrypted_Block_Device;                                            // Decrypted block device available after decryption
 	bool Removable;                                                           // Indicates if this partition is removable -- affects how often we check overall size, if present, etc.

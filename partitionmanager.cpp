@@ -25,7 +25,9 @@
 #include <sys/stat.h>
 #include <sys/vfs.h>
 #include <unistd.h>
+#include <algorithm>
 #include <map>
+#include <utility>
 #include <vector>
 #include <dirent.h>
 #include <time.h>
@@ -1971,8 +1973,18 @@ int TWPartitionManager::Format_Data(void) {
 #endif
 			if (metadata != NULL)
 				metadata->Mount(true);
-			if (!Check_Pending_Merges())
-				return false;
+			if (!Check_Pending_Merges()) {
+				LOGINFO("Format_Data: merge status check failed, wiping /metadata and retrying\n");
+				if (metadata != NULL) {
+					metadata->UnMount(false);
+					Wipe_By_Path("/metadata");
+					metadata->Mount(true);
+				}
+				if (!Check_Pending_Merges()) {
+					LOGERR("Format_Data: merge status check still failing after /metadata wipe\n");
+					return false;
+				}
+			}
 		}
 		ret = dat->Wipe_Encryption();
 	} else {
@@ -4656,7 +4668,9 @@ std::string TWPartitionManager::Get_Bare_Partition_Name(std::string Mount_Point)
 
 bool TWPartitionManager::Prepare_Super_Volume(TWPartition* twrpPart) {
     Fstab fstab;
-	std::string bare_partition_name = Get_Bare_Partition_Name(twrpPart->Get_Mount_Point());
+	std::string bare_partition_name = twrpPart->Get_Logical_Partition_Name();
+	if (bare_partition_name.empty())
+		bare_partition_name = Get_Bare_Partition_Name(twrpPart->Get_Mount_Point());
 
 	Super_Partition_List.push_back(bare_partition_name);
 	LOGINFO("Trying to prepare %s from super partition\n", bare_partition_name.c_str());
@@ -4847,20 +4861,28 @@ bool TWPartitionManager::Unmap_Super_Devices() {
 		LOGINFO("Checking partition: %s\n", (*iter)->Get_Mount_Point().c_str());
 		if ((*iter)->Is_Super) {
 			TWPartition *part = *iter;
-			std::string bare_partition_name = Get_Bare_Partition_Name((*iter)->Get_Mount_Point());
+			std::string bare_partition_name = (*iter)->Get_Logical_Partition_Name();
+			if (bare_partition_name.empty())
+				bare_partition_name = Get_Bare_Partition_Name((*iter)->Get_Mount_Point());
 			std::string blk_device_partition = bare_partition_name;
 			if (DataManager::GetIntValue("of_ab_device") == 1 || DataManager::GetStrValue("tw_has_boot_slots") == "1")
 				blk_device_partition.append(PartitionManager.Get_Active_Slot_Suffix());
-			(*iter)->UnMount(false);
-			LOGINFO("removing dynamic partition: %s\n", blk_device_partition.c_str());
-			destroyed = DestroyLogicalPartition(blk_device_partition);
+			bool force_lazy_umount = (bare_partition_name == "odm");
+			if (!(*iter)->UnMount(false) || force_lazy_umount) {
+				LOGINFO("UnMount failed for '%s', forcing lazy unmount before destroying it\n", (*iter)->Get_Mount_Point().c_str());
+				TWFunc::Exec_Cmd("umount -l " + (*iter)->Get_Mount_Point());
+				usleep(200000);
+			}
+			bool cow_destroyed = true;
 			std::string cow_partition = blk_device_partition + "-cow";
 			std::string cow_partition_path = "/dev/block/mapper/" + cow_partition;
 			struct stat st;
 			if (lstat(cow_partition_path.c_str(), &st) == 0) {
 				LOGINFO("removing cow partition: %s\n", cow_partition.c_str());
-				destroyed = DestroyLogicalPartition(cow_partition);
+				cow_destroyed = DestroyLogicalPartition(cow_partition);
 			}
+			LOGINFO("removing dynamic partition: %s\n", blk_device_partition.c_str());
+			destroyed = DestroyLogicalPartition(blk_device_partition) && cow_destroyed;
 			iter = Partitions.erase(iter);
 			delete part;
 			if (!destroyed) {
@@ -4878,13 +4900,25 @@ bool TWPartitionManager::Unmap_Super_Devices() {
 		while ((de = readdir(d)) != NULL) {
 			if (de->d_type == DT_LNK) {
 				std::string partition = de->d_name;
-				if (strcmp(partition.c_str(),"userdata") != 0){
-					LOGINFO("removing dynamic partition: %s\n", partition.c_str());
-					destroyed = DestroyLogicalPartition(partition);
-					if (!destroyed) {
-						closedir(d);
-						return false;
-					}
+				if (partition == "userdata") {
+					continue;
+				}
+
+				// Prepare_Super_Volume creates bare mapper aliases such as
+				// /dev/block/mapper/vendor -> vendor_a for image flashing. The
+				// targeted loop above has already removed the slot-suffixed logical
+				// partition, so the alias must not be treated as another DM device.
+				if (std::find(Super_Partition_List.begin(), Super_Partition_List.end(), partition) !=
+						Super_Partition_List.end()) {
+					LOGINFO("skipping logical partition alias: %s\n", partition.c_str());
+					continue;
+				}
+
+				LOGINFO("removing dynamic partition: %s\n", partition.c_str());
+				destroyed = DestroyLogicalPartition(partition);
+				if (!destroyed) {
+					closedir(d);
+					return false;
 				}
 			}
 		}
@@ -4897,11 +4931,6 @@ bool TWPartitionManager::Check_Pending_Merges() {
 	auto sm = android::snapshot::SnapshotManager::NewForFirstStageMount();
 	if (!sm) {
 		LOGERR("Unable to call snapshot manager\n");
-		return false;
-	}
-
-	if (!Unmap_Super_Devices()) {
-		LOGERR("Unable to unmap dynamic partitions.\n");
 		return false;
 	}
 
@@ -4919,45 +4948,272 @@ bool TWPartitionManager::Check_Pending_Merges() {
 	return true;
 }
 
+static bool Is_UsbOtg_Scsi_Disk(const std::string& disk) {
+	char block_device[PATH_MAX];
+	char sysfs_device[PATH_MAX];
+	char resolved_device[PATH_MAX];
+
+	if (disk.size() <= 2 || disk.compare(0, 2, "sd") != 0)
+		return false;
+
+	snprintf(block_device, sizeof(block_device), "/dev/block/%s", disk.c_str());
+	snprintf(sysfs_device, sizeof(sysfs_device), "/sys/block/%s/device", disk.c_str());
+	if (!TWFunc::Path_Exists(block_device) ||
+		realpath(sysfs_device, resolved_device) == NULL)
+		return false;
+
+	// UFS also appears as sdX. Only accept a device whose resolved parent
+	// traverses the USB bus, rather than relying on a volatile sdX name.
+	return strstr(resolved_device, "/usb") != NULL;
+}
+
+static bool Resolve_UsbOtg_Block_Device(std::string* block_device) {
+	DIR* block_directory = opendir("/sys/block");
+	if (block_directory == NULL) {
+		LOGINFO("Unable to scan /sys/block for USB OTG: %s\n", strerror(errno));
+		return false;
+	}
+
+	std::vector<std::string> disks;
+	struct dirent* entry;
+	while ((entry = readdir(block_directory)) != NULL) {
+		if (Is_UsbOtg_Scsi_Disk(entry->d_name))
+			disks.emplace_back(entry->d_name);
+	}
+	closedir(block_directory);
+	std::sort(disks.begin(), disks.end());
+
+	for (const std::string& disk : disks) {
+		char disk_directory[PATH_MAX];
+		snprintf(disk_directory, sizeof(disk_directory), "/sys/block/%s", disk.c_str());
+
+		DIR* partition_directory = opendir(disk_directory);
+		if (partition_directory == NULL)
+			continue;
+
+		std::vector<std::pair<long, std::string>> partitions;
+		while ((entry = readdir(partition_directory)) != NULL) {
+			std::string name = entry->d_name;
+			if (name.compare(0, disk.size(), disk) != 0 || name.size() == disk.size())
+				continue;
+
+			const char* suffix = name.c_str() + disk.size();
+			char* end = NULL;
+			long partition_number = strtol(suffix, &end, 10);
+			if (*suffix == '\0' || *end != '\0')
+				continue;
+
+			char partition_marker[PATH_MAX];
+			snprintf(partition_marker, sizeof(partition_marker),
+					 "/sys/block/%s/%s/partition", disk.c_str(), name.c_str());
+			if (TWFunc::Path_Exists(partition_marker))
+				partitions.emplace_back(partition_number, name);
+		}
+		closedir(partition_directory);
+
+		if (!partitions.empty()) {
+			std::sort(partitions.begin(), partitions.end());
+			*block_device = "/dev/block/" + partitions.front().second;
+		} else {
+			*block_device = "/dev/block/" + disk;
+		}
+		return true;
+	}
+
+	return false;
+}
+
+static constexpr char kUsbOtgRoleSwitch[] = "/sys/class/usb_role/11201000.usb0-role-switch/role";
+static constexpr char kUsbOtgEnable[] = "/sys/devices/platform/charger/power_supply/usb/otg_enable";
+static constexpr char kUsbOtgVbusSwitch[] = "/sys/devices/platform/extcon-usb/vbus_switch";
+static constexpr char kUsbOtgPreferredRole[] = "/sys/class/typec/port0/preferred_role";
+static constexpr time_t kUsbOtgHostTimeoutSeconds = 20;
+
+static bool UsbOtg_Host_Supported() {
+	return TWFunc::Path_Exists(kUsbOtgRoleSwitch) &&
+		TWFunc::Path_Exists(kUsbOtgEnable) &&
+		TWFunc::Path_Exists(kUsbOtgVbusSwitch) &&
+		TWFunc::Path_Exists(kUsbOtgPreferredRole);
+}
+
+static bool Enable_UsbOtg_Host_Mode() {
+	if (!UsbOtg_Host_Supported()) {
+		LOGERR("USB OTG host control nodes are unavailable\n");
+		return false;
+	}
+
+	// The stock policy prefers sink. With a passive Type-C OTG adapter this
+	// would make the controller accept external VBUS as a sink before the host
+	// controller has a chance to enumerate the drive. Set the preference before
+	// the user inserts the drive so the ensuing CC attach selects source/host.
+	if (!TWFunc::write_to_file(kUsbOtgPreferredRole, "source")) {
+		LOGERR("Unable to prefer Type-C source role for USB OTG\n");
+		return false;
+	}
+
+	// otg_enable only asks the charger driver to enter OTG policy. The
+	// extcon vbus switch owns the usb-otg-vbus regulator in the stock DTB and
+	// must be enabled as well, otherwise xHCI starts without powering a drive.
+	bool vbus_enabled = TWFunc::write_to_file(kUsbOtgVbusSwitch, "1");
+	bool otg_enabled = TWFunc::write_to_file(kUsbOtgEnable, "1");
+	bool host_selected = TWFunc::write_to_file(kUsbOtgRoleSwitch, "host");
+	if (!vbus_enabled || !otg_enabled || !host_selected) {
+		LOGERR("Unable to enable USB OTG host mode (vbus=%d, otg=%d, role=%d)\n",
+			   vbus_enabled, otg_enabled, host_selected);
+		TWFunc::write_to_file(kUsbOtgRoleSwitch, "device");
+		TWFunc::write_to_file(kUsbOtgEnable, "0");
+		TWFunc::write_to_file(kUsbOtgVbusSwitch, "0");
+		TWFunc::write_to_file(kUsbOtgPreferredRole, "sink");
+		return false;
+	}
+
+	LOGINFO("USB OTG host mode enabled\n");
+	return true;
+}
+
+static void Restore_UsbOtg_Device_Mode(bool* mtp_suspended, bool mtp_was_enabled) {
+	TWFunc::write_to_file(kUsbOtgVbusSwitch, "0");
+	TWFunc::write_to_file(kUsbOtgEnable, "0");
+	TWFunc::write_to_file(kUsbOtgRoleSwitch, "device");
+	TWFunc::write_to_file(kUsbOtgPreferredRole, "sink");
+	DataManager::SetValue("tw_usb_otg_host_active", 0);
+	// Let the USB role switch release the host controller before init binds
+	// the recovery gadget again.
+	usleep(500000);
+	if (*mtp_suspended) {
+		TWFunc::Toggle_MTP(mtp_was_enabled);
+		*mtp_suspended = false;
+	}
+}
+
 void TWPartitionManager::Check_UsbOtg_Status() {
 	static bool mtp_was_enabled;
+	static bool mtp_suspended = false;
 	static bool usbotg_mounted = false;
-	static string usbotg_prim = "";
-	static string usbotg_alt = "";
+	static bool host_switch_pending = false;
+	static bool host_disabled_by_user = false;
+	static time_t host_switch_started = 0;
+	static std::string mounted_device = "";
 	static TWPartition* usbotg = Find_Partition_By_Path("usb_otg");
+	std::string resolved_device;
+	time_t now = time(NULL);
 
-	if (usbotg && !usbotg->Primary_Block_Device.empty()) {
-		usbotg_prim = usbotg->Primary_Block_Device;
-		usbotg_alt = usbotg->Alternate_Block_Device;
-	} else return;
-
-	if (TWFunc::Path_Exists(usbotg_prim) || (!usbotg_alt.empty() && TWFunc::Path_Exists(usbotg_alt))) {
-		// Auto-mount only once when usb_otg was connected
-		if (!usbotg_mounted) goto mount;
-	} else if (usbotg_mounted) {
-		// Is seems usb_otg was disconnected, so unmount it
-		goto unmount;
+	if (usbotg == NULL || !UsbOtg_Host_Supported()) {
+		DataManager::SetValue("tw_has_usb_otg", 0);
+		return;
 	}
-	return;
+	DataManager::SetValue("tw_has_usb_otg", 1);
 
-mount:
-	mtp_was_enabled = TWFunc::Toggle_MTP(false);
-	usbotg->Mount(true);
-	usbotg_mounted = true;
-	if (PageManager::GetCurrentPage() == "filemanagerlist" && DataManager::GetStrValue("tw_file_location1") == "/usb_otg")
-		gui_changePage("filemanagerlist");
-	return;
+	if (DataManager::GetIntValue("tw_usb_otg_host_stop")) {
+		DataManager::SetValue("tw_usb_otg_host_stop", 0);
+		DataManager::SetValue("tw_usb_otg_host_request", 0);
+		host_switch_pending = false;
+		host_disabled_by_user = true;
+		host_switch_started = 0;
+		if (usbotg_mounted)
+			usbotg->UnMount(false);
+		usbotg_mounted = false;
+		mounted_device.clear();
+		usbotg->Primary_Block_Device.clear();
+		usbotg->Alternate_Block_Device.clear();
+		usbotg->Actual_Block_Device.clear();
+		usbotg->Is_Present = false;
+		usbotg->Size = 0;
+		usbotg->Used = 0;
+		usbotg->Free = 0;
+		Restore_UsbOtg_Device_Mode(&mtp_suspended, mtp_was_enabled);
+		LOGINFO("USB OTG host mode stopped by user\n");
+		return;
+	}
+	if (DataManager::GetIntValue("tw_usb_otg_host_request"))
+		host_disabled_by_user = false;
+	if (host_disabled_by_user)
+		return;
+	if (DataManager::GetIntValue("tw_usb_otg_host_request")) {
+		// Disable the recovery gadget before requesting host mode. Disable_MTP()
+		// normally leaves ADB active, so explicitly unbind it for this explicit
+		// transition. Do not infer host mode from Type-C role: rodin only starts
+		// sourcing VBUS after this request.
+		DataManager::SetValue("tw_usb_otg_host_request", 0);
+		mtp_was_enabled = TWFunc::Toggle_MTP(false);
+		mtp_suspended = true;
+		property_set("sys.usb.config", "none");
+		host_switch_pending = true;
+		host_switch_started = 0;
+		DataManager::SetValue("tw_usb_otg_host_active", 1);
+		LOGINFO("USB OTG host mode requested by user; preparing host controller\n");
+		return;
+	}
 
-unmount:
-	usbotg->UnMount(false);
+	if (Resolve_UsbOtg_Block_Device(&resolved_device)) {
+		host_switch_pending = false;
+		host_switch_started = 0;
+		if (usbotg_mounted && mounted_device == resolved_device)
+			return;
+
+		if (usbotg_mounted)
+			usbotg->UnMount(false);
+
+		usbotg->Primary_Block_Device = resolved_device;
+		usbotg->Alternate_Block_Device.clear();
+		usbotg->Actual_Block_Device = resolved_device;
+		usbotg->Can_Be_Mounted = true;
+		usbotg->Is_Present = true;
+		if (!mtp_suspended) {
+			mtp_was_enabled = TWFunc::Toggle_MTP(false);
+			mtp_suspended = true;
+		}
+		DataManager::SetValue("tw_usb_otg_host_active", 1);
+		usbotg_mounted = usbotg->Mount(true);
+		mounted_device = resolved_device;
+		if (PageManager::GetCurrentPage() == "filemanagerlist" &&
+			DataManager::GetStrValue("tw_file_location1") == "/usb_otg")
+			gui_changePage("filemanagerlist");
+		return;
+	}
+
+	if (usbotg_mounted) {
+		usbotg->UnMount(false);
+		usbotg_mounted = false;
+		mounted_device.clear();
+		Restore_UsbOtg_Device_Mode(&mtp_suspended, mtp_was_enabled);
+	}
+	usbotg->Primary_Block_Device.clear();
+	usbotg->Alternate_Block_Device.clear();
+	usbotg->Actual_Block_Device.clear();
 	usbotg->Is_Present = false;
 	usbotg->Size = 0;
 	usbotg->Used = 0;
 	usbotg->Free = 0;
-	usbotg_mounted = false;
-	if (PageManager::GetCurrentPage() == "filemanagerlist" && DataManager::GetStrValue("tw_file_location1") == "/usb_otg")
+
+	if (host_switch_pending) {
+		if (host_switch_started == 0) {
+			if (Enable_UsbOtg_Host_Mode()) {
+				host_switch_started = now;
+			} else {
+				host_switch_pending = false;
+				Restore_UsbOtg_Device_Mode(&mtp_suspended, mtp_was_enabled);
+			}
+			return;
+		}
+
+		if (now - host_switch_started < kUsbOtgHostTimeoutSeconds)
+			return;
+
+		LOGINFO("USB OTG device did not enumerate; restoring device mode\n");
+		host_switch_pending = false;
+		host_switch_started = 0;
+		Restore_UsbOtg_Device_Mode(&mtp_suspended, mtp_was_enabled);
+		return;
+	}
+
+	if (mtp_suspended) {
+		Restore_UsbOtg_Device_Mode(&mtp_suspended, mtp_was_enabled);
+	}
+
+	if (PageManager::GetCurrentPage() == "filemanagerlist" &&
+		DataManager::GetStrValue("tw_file_location1") == "/usb_otg")
 		gui_changePage("filemanagerlist");
-	TWFunc::Toggle_MTP(mtp_was_enabled);
 }
 
 std::pair<string, string> TWPartitionManager::Get_Partition_Checksums(TWPartition* twrpPart) {

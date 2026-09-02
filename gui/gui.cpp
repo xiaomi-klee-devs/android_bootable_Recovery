@@ -122,6 +122,7 @@ public:
 		key_repeat_ms = 100;
 		touch_status = TS_NONE;
 		key_status = KS_NONE;
+		key_chord_status = KC_NONE;
 		state = AS_NO_ACTION;
 		x = y = 0;
 
@@ -161,12 +162,19 @@ private:
 		KS_KEY_REPEAT = 2,
 	};
 
+	enum key_chord_status_enum {
+		KC_NONE = 0,
+		KC_SCREENSHOT,
+		KC_FLASHLIGHT,
+	};
+
 	enum action_state_enum {
 		AS_IN_ACTION_AREA = 0, // we've touched a spot with an action
 		AS_NO_ACTION = 1,    // we've touched in an empty area (no action) and ignore remaining events until touch release
 	};
 	touch_status_enum touch_status;
 	key_status_enum key_status;
+	key_chord_status_enum key_chord_status;
 	action_state_enum state;
 	int x, y; // x and y coordinates of last touch
 	struct timeval touchStart; // used to track time for long press / key repeat
@@ -175,11 +183,37 @@ private:
 	void process_EV_REL(input_event& ev);
 	void process_EV_ABS(input_event& ev);
 	void process_EV_KEY(input_event& ev);
+	bool processKeyChord(HardwareKeyboard* kb);
 
 	void doTouchStart();
 };
 
 InputHandler input_handler;
+
+bool InputHandler::processKeyChord(HardwareKeyboard* kb)
+{
+	if (key_chord_status != KC_NONE)
+		return false;
+
+	if (kb->AreKeysPressed(KEY_VOLUMEUP, KEY_POWER)) {
+		GUIAction::flashlightImpl("");
+		key_chord_status = KC_FLASHLIGHT;
+	} else if (kb->AreKeysPressed(KEY_VOLUMEDOWN, KEY_POWER)) {
+		GUIAction::screenshotImpl("");
+		key_chord_status = KC_SCREENSHOT;
+	} else {
+		return false;
+	}
+
+	DataManager::Vibrate("tw_button_vibrate");
+	g_suppress_power_toggle_until_ms = nowMs() + 1000;
+	key_status = KS_KEY_REPEAT;
+	mime = 0;
+	// Screenshot rendering can take longer than the power-key hold threshold.
+	// Start repeat timing after the chord action so it cannot become hkey=power.
+	gettimeofday(&touchStart, NULL);
+	return true;
+}
 
 
 bool InputHandler::processInput(int timeout_ms)
@@ -287,14 +321,7 @@ void InputHandler::processHoldAndRepeat()
 		gettimeofday(&touchStart, NULL);
 		key_status = KS_KEY_REPEAT;
 
-		if (kb->AreKeysPressed(KEY_VOLUMEUP, KEY_POWER)) {
-			GUIAction::flashlightImpl("");
-			DataManager::Vibrate("tw_button_vibrate");
-		} else if (kb->AreKeysPressed(KEY_VOLUMEDOWN, KEY_POWER)) {
-			GUIAction::screenshotImpl("");
-			DataManager::Vibrate("tw_button_vibrate");
-			g_suppress_power_toggle_until_ms = nowMs() + 1000; // prevent screen-off from power key after screenshot
-		} else if (kb->IsKeyDown(KEY_POWER) && DataManager::GetStrValue("of_hw_control_mode") == "1") {
+		if (kb->IsKeyDown(KEY_POWER) && DataManager::GetStrValue("of_hw_control_mode") == "1") {
 			PageManager::SelectFocusedElement(true);
 		} else {
 			kb->KeyRepeat();
@@ -313,7 +340,10 @@ void InputHandler::processHoldAndRepeat()
 		LOGEVENT("KEY_REPEAT: %d,%d\n", x, y);
 		gettimeofday(&touchStart, NULL);
 		mime = mtime;
-		kb->KeyRepeat();
+		if (key_chord_status == KC_NONE)
+			kb->KeyRepeat();
+		else
+			mime = 0;
 	}
 }
 
@@ -424,8 +454,14 @@ void InputHandler::process_EV_KEY(input_event& ev)
 			key_status = KS_NONE;
 			touch_status = TS_NONE;
 		}
+		processKeyChord(kb);
 	} else {
 		// This is a key release
+		bool chord_key_release =
+			(key_chord_status == KC_SCREENSHOT &&
+			 (ev.code == KEY_VOLUMEDOWN || ev.code == KEY_POWER)) ||
+			(key_chord_status == KC_FLASHLIGHT &&
+			 (ev.code == KEY_VOLUMEUP || ev.code == KEY_POWER));
 		if (DataManager::GetStrValue("of_hw_control_mode") == "1") {
 			if (!blankTimer.isScreenOff()) {
 				if (ev.code == KEY_VOLUMEUP && key_status != KS_KEY_REPEAT) {
@@ -438,7 +474,8 @@ void InputHandler::process_EV_KEY(input_event& ev)
 				}
 				if (ev.code == KEY_POWER && key_status != KS_KEY_REPEAT) {
 					LOGEVENT("POWER Key Released\n");
-					PageManager::SelectFocusedElement(false);
+					if (!chord_key_release)
+						PageManager::SelectFocusedElement(false);
 				}
 			} else {
 				blankTimer.toggleBlank();
@@ -447,15 +484,21 @@ void InputHandler::process_EV_KEY(input_event& ev)
 			if (ev.code == KEY_POWER && key_status != KS_KEY_REPEAT) {
 				LOGEVENT("POWER Key Released\n");
 				long long now = nowMs();
-				if (now < g_suppress_power_toggle_until_ms) {
-					LOGEVENT("Skipping POWER toggle due to recent screenshot\n");
+				if (chord_key_release || now < g_suppress_power_toggle_until_ms) {
+					LOGEVENT("Skipping POWER toggle due to hardware key chord\n");
 				} else {
 					blankTimer.toggleBlank();
 				}
 			}
 		}
-		if (mime <= 500)
+		if (chord_key_release || mime <= 500)
 			kb->KeyUp(ev.code);
+		if (key_chord_status == KC_SCREENSHOT &&
+			!kb->IsKeyDown(KEY_VOLUMEDOWN) && !kb->IsKeyDown(KEY_POWER))
+			key_chord_status = KC_NONE;
+		else if (key_chord_status == KC_FLASHLIGHT &&
+			!kb->IsKeyDown(KEY_VOLUMEUP) && !kb->IsKeyDown(KEY_POWER))
+			key_chord_status = KC_NONE;
 		key_status = KS_NONE;
 		touch_status = TS_NONE;
 #ifdef TW_USE_KEY_CODE_TOUCH_SYNC

@@ -369,25 +369,29 @@ int DataManager::SaveValues()
   #ifndef OF_DEVICE_WITHOUT_PERSIST
   if (PartitionManager.Mount_By_Path("/persist", false))
     {
-      #ifndef FOX_SETTINGS_ROOT_DIRECTORY
-      mPersist.SetFile(PERSIST_SETTINGS_FILE);
-      mPersist.SetFileVersion(FILE_VERSION);
-      pthread_mutex_lock(&m_valuesLock);
-      mPersist.SaveValues();
-      pthread_mutex_unlock(&m_valuesLock);
-      LOGINFO("Saved settings file values to %s\n", PERSIST_SETTINGS_FILE);
-      #endif
+      if (access("/persist/.", W_OK) == 0) {
+        #ifndef FOX_SETTINGS_ROOT_DIRECTORY
+        mPersist.SetFile(PERSIST_SETTINGS_FILE);
+        mPersist.SetFileVersion(FILE_VERSION);
+        pthread_mutex_lock(&m_valuesLock);
+        mPersist.SaveValues();
+        pthread_mutex_unlock(&m_valuesLock);
+        LOGINFO("Saved settings file values to %s\n", PERSIST_SETTINGS_FILE);
+        #endif
 
-      ofstream file;
+        ofstream file;
 
-      file.open(FOX_PASS_IN_PERSIST, std::ofstream::out | std::ofstream::trunc);
-      if (file.is_open()) {
-        file << "fox_use_pass="    + DataManager::GetStrValue("fox_use_pass") +
-                "\nfox_pass_true=" + DataManager::GetStrValue("fox_pass_true") +
-                "\nfox_pass_type=" + DataManager::GetStrValue("fox_pass_type");
-        LOGINFO("PassBak: Created backup\n");
-        file.close();
-      } else LOGINFO("PassBak: Failed to backup\n");
+        file.open(FOX_PASS_IN_PERSIST, std::ofstream::out | std::ofstream::trunc);
+        if (file.is_open()) {
+          file << "fox_use_pass="    + DataManager::GetStrValue("fox_use_pass") +
+                  "\nfox_pass_true=" + DataManager::GetStrValue("fox_pass_true") +
+                  "\nfox_pass_type=" + DataManager::GetStrValue("fox_pass_type");
+          LOGINFO("PassBak: Created backup\n");
+          file.close();
+        } else LOGINFO("PassBak: Failed to backup\n");
+      } else {
+        LOGINFO("Persist is mounted read-only; skipping OrangeFox settings write\n");
+      }
     }
   #endif
 
@@ -1833,4 +1837,3 @@ void DataManager::Leds(bool enable)
     }
 }
 #endif
-

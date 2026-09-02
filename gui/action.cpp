@@ -971,6 +971,19 @@ int GUIAction::mount(std::string arg)
       else
 	gui_msg("simulating=Simulating actions...");
     }
+  else if (arg == "otg")
+    {
+      if (!simulate)
+	{
+	  // The rodin Type-C controller only powers VBUS after host mode is
+	  // requested. Keep this explicit so a recovery boot never steals the
+	  // computer/ADB connection merely because a cable is attached.
+	  DataManager::SetValue("tw_usb_otg_host_stop", 0);
+	  DataManager::SetValue("tw_usb_otg_host_request", 1);
+	}
+      else
+	gui_msg("simulating=Simulating actions...");
+    }
   else if (!simulate)
     {
       PartitionManager.Mount_By_Path(arg, true);
@@ -990,6 +1003,18 @@ int GUIAction::unmount(std::string arg)
       else
 	gui_msg("simulating=Simulating actions...");
       DataManager::SetValue(TW_ACTION_BUSY, 0);
+    }
+  else if (arg == "otg")
+    {
+      if (!simulate)
+	{
+	  // The one-second OTG monitor owns the role switch. Asking it to stop
+	  // avoids racing a mounted filesystem or a pending enumeration.
+	  DataManager::SetValue("tw_usb_otg_host_request", 0);
+	  DataManager::SetValue("tw_usb_otg_host_stop", 1);
+	}
+      else
+	gui_msg("simulating=Simulating actions...");
     }
   else if (!simulate)
     {

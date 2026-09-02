@@ -53,7 +53,7 @@ endif
 
 OF_CURRENT_BRANCH := $(shell git -C $(call my-dir) branch --show-current 2>/dev/null)
 ifeq ($(OF_CURRENT_BRANCH),)
-    LOCAL_CFLAGS += -DOF_CURRENT_BRANCH='"broken repo"'
+    LOCAL_CFLAGS += -DOF_CURRENT_BRANCH='"fox_14.1"'
 else
     LOCAL_CFLAGS += -DOF_CURRENT_BRANCH='"$(OF_CURRENT_BRANCH)"'
 endif
@@ -693,6 +693,16 @@ ifeq ($(FOX_ALLOW_EARLY_SETTINGS_LOAD),1)
     #   $(error You cannot use "FOX_ALLOW_EARLY_SETTINGS_LOAD" without "FOX_SETTINGS_ROOT_DIRECTORY")
     #endif
     LOCAL_CFLAGS += -DFOX_ALLOW_EARLY_SETTINGS_LOAD='"1"'
+endif
+
+# Some devices cannot safely destroy and recreate the complete GUI package
+# after FBE unlock. Their initial package and normal settings load stay intact.
+ifeq ($(OF_SKIP_POST_DECRYPT_THEME_RELOAD),1)
+    LOCAL_CFLAGS += -DOF_SKIP_POST_DECRYPT_THEME_RELOAD=1
+endif
+
+ifeq ($(OF_LOAD_DEFAULT_LANGUAGE_BEFORE_DECRYPT),1)
+    LOCAL_CFLAGS += -DOF_LOAD_DEFAULT_LANGUAGE_BEFORE_DECRYPT=1
 endif
 
 # whether to wipe /metadata after formatting data

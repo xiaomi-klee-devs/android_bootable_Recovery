@@ -321,6 +321,43 @@ bool twrpRepacker::Repack_Image_And_Flash(const std::string& Target_Image, const
 	return true;
 }
 
+// Extracts the recovery/vendor_boot image of the currently active slot into /tmp.
+// Meant to be called once, very early at boot (right after the fstab/partitions are
+// set up), so that a later "Flash Current OrangeFox" doesn't need to dd the partition
+// again - it can just reuse the file that's already sitting in /tmp.
+bool twrpRepacker::Cache_Current_Image() {
+#ifndef OF_RECOVERY_AB_FULL_REFLASH_RAMDISK
+	std::string slot = android::base::GetProperty("ro.boot.slot_suffix", "");
+	if (slot.empty())
+		slot = android::base::GetProperty("ro.boot.slot", "");
+
+	std::string dest_partition = "/recovery";
+	#if defined(FOX_VENDOR_BOOT_RECOVERY) || defined(BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT)
+		dest_partition = "/vendor_boot";
+	#endif
+
+	if (slot.empty() || !PartitionManager.Find_Partition_By_Path(dest_partition))
+		return false;
+
+	std::string root = "/dev/block/by-name" + dest_partition;
+	std::string src = (slot == "_a" || slot == "a") ? (root + "_a") : (root + "_b");
+
+	std::string tmp_filename = dest_partition.substr(1) + ".img"; // "vendor_boot.img" / "recovery.img"
+	std::string tmp_full = "/tmp/" + tmp_filename;
+
+	std::string command = "dd bs=1048576 if=" + src + " of=" + tmp_full;
+	LOGINFO("Command=%s\n", command.c_str());
+	if (TWFunc::Exec_Cmd(command) != 0) {
+		LOGERR("Failed to cache the current %s image to '%s'\n", dest_partition.c_str(), tmp_full.c_str());
+		return false;
+	}
+	LOGINFO("Cached the current %s image to '%s'\n", dest_partition.c_str(), tmp_full.c_str());
+	return true;
+#else
+	return false;
+#endif
+}
+
 bool twrpRepacker::Flash_Current_Twrp() {
 #ifndef OF_RECOVERY_AB_FULL_REFLASH_RAMDISK
 	// A/B with dedicated recovery partition
@@ -334,33 +371,53 @@ bool twrpRepacker::Flash_Current_Twrp() {
 	#endif
 
 	if (!slot.empty() && PartitionManager.Find_Partition_By_Path(dest_partition)) {
-		std::string root, src, dest;
-		root = "/dev/block/bootdevice/by-name" + dest_partition;
-		if (slot == "_a" || slot == "a") {
+		std::string root, src;
+		root = "/dev/block/by-name" + dest_partition;
+		if (slot == "_a" || slot == "a")
 			src = root + "_a";
-			dest= root + "_b";
-		}
-		else {
+		else
 			src = root + "_b";
-			dest= root + "_a";
-		}
+
 		PartitionManager.Unlock_Block_Partitions();
 
-		// only copy the relevant active slot to the inactive slot, on the basis that the recovery currently running
-		// in the active slot can simply be copied over to the inactive slot, so that both have the same recovery image
-		std::string command = "dd bs=1048576 if=" + src + " of=" + dest;
-		LOGINFO("Command=%s\n", command.c_str());
+		std::string tmp_path = "/tmp";
+		std::string tmp_filename = dest_partition.substr(1) + ".img"; // e.g. "vendor_boot.img" / "recovery.img"
+		std::string tmp_full = tmp_path + "/" + tmp_filename;
 
-		if (TWFunc::Exec_Cmd(command) != 0) {
-			LOGERR("Failed to flash the %s image\n\n", dest_partition.c_str());
+		if (TWFunc::Path_Exists(tmp_full)) {
+			// already cached at boot - no need to dd it again
+			LOGINFO("Reusing cached image already at '%s'\n", tmp_full.c_str());
+		} else {
+			// fallback: cache wasn't there for some reason, extract it now,
+			// same as a user manually picking an image file from /sdcard to flash
+			std::string command = "dd bs=1048576 if=" + src + " of=" + tmp_full;
+			LOGINFO("Command=%s\n", command.c_str());
+			if (TWFunc::Exec_Cmd(command) != 0) {
+				LOGERR("Failed to extract the current %s image to '%s'\n\n", dest_partition.c_str(), tmp_full.c_str());
+				return false;
+			}
+		}
+
+		// now flash that image the same way the GUI does with "flash to both slots" checked:
+		// flash to the currently active slot, override to the other slot, flash again, then restore the slot
+		DataManager::SetValue("tw_flash_partition", dest_partition + ";");
+		std::string current_slot = PartitionManager.Get_Active_Slot_Display();
+
+		bool ok = PartitionManager.Flash_Image(tmp_path, tmp_filename);
+		if (ok) {
+			PartitionManager.Override_Active_Slot(current_slot == "A" ? "B" : "A");
+			ok = PartitionManager.Flash_Image(tmp_path, tmp_filename);
+			PartitionManager.Override_Active_Slot(current_slot);
+		}
+
+		// leave the cached image in /tmp (tmpfs) - it clears itself on reboot,
+		// and staying there lets a repeat "Flash Current OrangeFox" reuse it too
+		if (!ok) {
+			LOGERR("Failed to flash the %s image to both slots\n\n", dest_partition.c_str());
 			return false;
 		}
-		else {
-			gui_print("Finished flashing the %s image\n\n", dest_partition.c_str());
-			return true;
-		}
-		// if we reach here, something is awry - bale out
-		return false;
+		gui_print("Finished flashing the %s image to both slots\n\n", dest_partition.c_str());
+		return true;
 	}
 #endif
 

@@ -818,51 +818,9 @@
 			
 			<listbox>
 				<placement x="0" y="%row2_1_y%" w="%screen_w%" h="%lb_l1%"/>
-				<font resource="font1" spacing="%fileselector_spacing%" color="%text%" />
+				<font resource="font8" spacing="%fileselector_spacing%" color="%text%" />
 				<data name="theme_font_tmp"/>
-				<listitem name="Roboto">Roboto</listitem>
-			</listbox>
-			
-			<listbox>
-				<placement x="0" y="%row2_2a_y%" w="%screen_w%" h="%lb_l1%"/>
-				<font resource="font2" spacing="%fileselector_spacing%" color="%text%" />
-				<data name="theme_font_tmp"/>
-				<listitem name="Roboto Slab">RobotoSlab</listitem>
-			</listbox>
-			
-			<listbox>
-				<placement x="0" y="%row3_1_y%" w="%screen_w%" h="%lb_l1%"/>
-				<font resource="font3" spacing="%fileselector_spacing%" color="%text%" />
-				<data name="theme_font_tmp"/>
-				<listitem name="Google Sans">GoogleSans</listitem>
-			</listbox>
-			
-			<listbox>
-				<placement x="0" y="%row3_2a_y%" w="%screen_w%" h="%lb_l1%"/>
-				<font resource="font4" spacing="%fileselector_spacing%" color="%text%" />
-				<data name="theme_font_tmp"/>
-				<listitem name="Euclid Flex">EuclidFlex</listitem>
-			</listbox>
-			
-			<listbox>
-				<placement x="0" y="%row4_1_y%" w="%screen_w%" h="%lb_l1%"/>
-				<font resource="font5" spacing="%fileselector_spacing%" color="%text%" />
-				<data name="theme_font_tmp"/>
-				<listitem name="Fira Code">FiraCode</listitem>
-			</listbox>
-			
-			<listbox>
-				<placement x="0" y="%row4_2a_y%" w="%screen_w%" h="%lb_l1%"/>
-				<font resource="font6" spacing="%fileselector_spacing%" color="%text%" />
-				<data name="theme_font_tmp"/>
-				<listitem name="Exo 2">Exo2</listitem>
-			</listbox>
-			
-			<listbox>
-				<placement x="0" y="%row5_1_y%" w="%screen_w%" h="%lb_l1%"/>
-				<font resource="font7" spacing="%fileselector_spacing%" color="%text%" />
-				<data name="theme_font_tmp"/>
-				<listitem name="Inter Display">InterDisplay</listitem>
+				<listitem name="MiSans">MiSans</listitem>
 			</listbox>
 			
 			<action>
@@ -928,51 +886,9 @@
 			
 			<listbox>
 				<placement x="0" y="%row2_1_y%" w="%screen_w%" h="%lb_l1%"/>
-				<font resource="font1" spacing="%fileselector_spacing%" color="%text%" />
+				<font resource="font8" spacing="%fileselector_spacing%" color="%text%" />
 				<data name="theme_sec_font_tmp"/>
-				<listitem name="Roboto">Roboto</listitem>
-			</listbox>
-			
-			<listbox>
-				<placement x="0" y="%row2_2a_y%" w="%screen_w%" h="%lb_l1%"/>
-				<font resource="font2" spacing="%fileselector_spacing%" color="%text%" />
-				<data name="theme_sec_font_tmp"/>
-				<listitem name="Roboto Slab">RobotoSlab</listitem>
-			</listbox>
-			
-			<listbox>
-				<placement x="0" y="%row3_1_y%" w="%screen_w%" h="%lb_l1%"/>
-				<font resource="font3" spacing="%fileselector_spacing%" color="%text%" />
-				<data name="theme_sec_font_tmp"/>
-				<listitem name="Google Sans">GoogleSans</listitem>
-			</listbox>
-			
-			<listbox>
-				<placement x="0" y="%row3_2a_y%" w="%screen_w%" h="%lb_l1%"/>
-				<font resource="font4" spacing="%fileselector_spacing%" color="%text%" />
-				<data name="theme_sec_font_tmp"/>
-				<listitem name="Euclid Flex">EuclidFlex</listitem>
-			</listbox>
-			
-			<listbox>
-				<placement x="0" y="%row4_1_y%" w="%screen_w%" h="%lb_l1%"/>
-				<font resource="font5" spacing="%fileselector_spacing%" color="%text%" />
-				<data name="theme_sec_font_tmp"/>
-				<listitem name="Fira Code">FiraCode</listitem>
-			</listbox>
-			
-			<listbox>
-				<placement x="0" y="%row4_2a_y%" w="%screen_w%" h="%lb_l1%"/>
-				<font resource="font6" spacing="%fileselector_spacing%" color="%text%" />
-				<data name="theme_sec_font_tmp"/>
-				<listitem name="Exo 2">Exo2</listitem>
-			</listbox>
-			
-			<listbox>
-				<placement x="0" y="%row5_1_y%" w="%screen_w%" h="%lb_l1%"/>
-				<font resource="font7" spacing="%fileselector_spacing%" color="%text%" />
-				<data name="theme_sec_font_tmp"/>
-				<listitem name="Inter Display">InterDisplay</listitem>
+				<listitem name="MiSans">MiSans</listitem>
 			</listbox>
 			
 			<action>
@@ -1888,7 +1804,7 @@
 			<action>
 				<action function="ftls">
 					#Remove theme
-					if [[ '%remove_theme%' = '1' ]] || [[ '%theme_style_tmp%' = 'Cream' &amp;&amp; '%theme_accent_tmp%' = 'Orange' &amp;&amp; '%theme_font_tmp%' = 'Roboto' &amp;&amp; '%theme_sec_font_tmp%' = 'GoogleSans' &amp;&amp; '%theme_font_size_tmp%' = 'n' ]]; then
+					if [[ '%remove_theme%' = '1' ]] || [[ '%theme_style_tmp%' = 'Cream' &amp;&amp; '%theme_accent_tmp%' = 'Orange' &amp;&amp; '%theme_font_tmp%' = 'MiSans' &amp;&amp; '%theme_sec_font_tmp%' = 'MiSans' &amp;&amp; '%theme_font_size_tmp%' = 'n' ]]; then
 						[ -d "%fox_theme_path%" ] &amp;&amp; rm -rf %fox_theme_path%;
 						[[ '%update_navbar%' = '1' ]] || exit;
 					else

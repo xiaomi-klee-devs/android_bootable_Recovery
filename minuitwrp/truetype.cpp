@@ -35,6 +35,9 @@ static FontData font_data = {
 	.mutex = PTHREAD_MUTEX_INITIALIZER
 };
 
+static constexpr const char* kFallbackFontPath =
+	"/twres/fonts/MiSans.ttf";
+
 twrpTruetype::twrpTruetype(void) {
 
 }
@@ -129,9 +132,24 @@ void* twrpTruetype::gr_ttf_loadFont(const char *filename, int size, int dpi) {
 	res->size = size;
 	res->dpi = dpi;
 	res->face = face;
+	res->fallback_face = nullptr;
 	res->max_height = -1;
 	res->base = -1;
 	res->refcount = 1;
+
+	if (access(kFallbackFontPath, R_OK) == 0 && fontFileName != kFallbackFontPath)
+	{
+		FT_Face fallback_face;
+		error = FT_New_Face(font_data.ft_library, kFallbackFontPath, 0, &fallback_face);
+		if (!error)
+		{
+			error = FT_Set_Char_Size(fallback_face, 0, size*16, dpi, dpi);
+			if (!error)
+				res->fallback_face = fallback_face;
+			else
+				FT_Done_Face(fallback_face);
+		}
+	}
 
 	pthread_mutex_init(&res->mutex, 0);
 
@@ -185,8 +203,11 @@ void twrpTruetype::gr_ttf_freeFont(void *font) {
 	TrueTypeFont *d = (TrueTypeFont *)font;
 	if(--d->refcount == 0)
 	{
+		TrueTypeFontMap::iterator trueTypeFontIt = font_data.fonts.find(*(d->key));
 		delete d->key;
 
+		if (d->fallback_face)
+			FT_Done_Face(d->fallback_face);
 		FT_Done_Face(d->face);
 
 		StringCacheMap::iterator stringCacheEntryIt = d->string_cache.begin();
@@ -203,7 +224,6 @@ void twrpTruetype::gr_ttf_freeFont(void *font) {
 
 		pthread_mutex_destroy(&d->mutex);
 
-		TrueTypeFontMap::iterator trueTypeFontIt = font_data.fonts.find(*(d->key));
 		delete d;
 		font_data.fonts.erase(trueTypeFontIt);
 
@@ -221,23 +241,40 @@ TrueTypeCacheEntry* twrpTruetype::gr_ttf_glyph_cache_peek(TrueTypeFont *font, in
 	return nullptr;
 }
 
+int twrpTruetype::gr_ttf_get_char_index(TrueTypeFont *font, unsigned int unicode) {
+	FT_UInt char_index = FT_Get_Char_Index(font->face, unicode);
+	if (char_index || !unicode || !font->fallback_face)
+		return static_cast<int>(char_index);
+
+	char_index = FT_Get_Char_Index(font->fallback_face, unicode);
+	return char_index ? -static_cast<int>(char_index) : 0;
+}
+
 TrueTypeCacheEntry* twrpTruetype::gr_ttf_glyph_cache_get(TrueTypeFont *font, int char_index) {
 	TrueTypeCacheEntryMap::iterator glyphCacheItr = font->glyph_cache.find(char_index);
 	TrueTypeCacheEntry* res = nullptr;
 	if(glyphCacheItr == font->glyph_cache.end())
 	{
-		int error = FT_Load_Glyph(font->face, char_index, FT_LOAD_RENDER);
+		FT_Face face = font->face;
+		int glyph_index = char_index;
+		if (char_index < 0 && font->fallback_face)
+		{
+			face = font->fallback_face;
+			glyph_index = -char_index;
+		}
+
+		int error = FT_Load_Glyph(face, glyph_index, FT_LOAD_RENDER);
 		if(error)
 		{
-			fprintf(stderr, "Failed to load glyph idx %d: %d\n", char_index, error);
+			fprintf(stderr, "Failed to load glyph idx %d: %d\n", glyph_index, error);
 			return nullptr;
 		}
 
 		FT_BitmapGlyph glyph;
-		error = FT_Get_Glyph(font->face->glyph, (FT_Glyph*)&glyph);
+		error = FT_Get_Glyph(face->glyph, (FT_Glyph*)&glyph);
 		if(error)
 		{
-			fprintf(stderr, "Failed to copy glyph %d: %d\n", char_index, error);
+			fprintf(stderr, "Failed to copy glyph %d: %d\n", glyph_index, error);
 			return nullptr;
 		}
 
@@ -319,6 +356,19 @@ void twrpTruetype::gr_ttf_calcMaxFontHeight(TrueTypeFont *f) {
 		}
 	}
 
+	// Include a representative CJK glyph in the line metrics when the active
+	// Latin font needs the recovery fallback face.
+	char_idx = gr_ttf_get_char_index(f, 0x4E2D);
+	if (char_idx < 0)
+	{
+		ent = gr_ttf_glyph_cache_get(f, char_idx);
+		if (ent)
+		{
+			bbox.yMin = MIN(bbox.yMin, ent->bbox.yMin);
+			bbox.yMax = MAX(bbox.yMax, ent->bbox.yMax);
+		}
+	}
+
 	if(bbox.yMin > bbox.yMax)
 		bbox.yMin = bbox.yMax = 0;
 
@@ -354,14 +404,14 @@ int twrpTruetype::gr_ttf_render_text(TrueTypeFont *font, GGLSurface *surface, co
 		text_itr += utf_bytes;
 		bytes_rendered += utf_bytes;
 
-		char_idx = FT_Get_Char_Index(f->face, unicode);
+		char_idx = gr_ttf_get_char_index(f, unicode);
 		char_idxs[char_idxs_len] = char_idx;
 		ent = gr_ttf_glyph_cache_get(f, char_idx);
 		if(ent)
 		{
 			diff = ent->glyph->root.advance.x >> 16;
 
-			if(FT_HAS_KERNING(f->face) && prev_idx && char_idx)
+			if(FT_HAS_KERNING(f->face) && prev_idx > 0 && char_idx > 0)
 			{
 				FT_Get_Kerning(f->face, prev_idx, char_idx, FT_KERNING_DEFAULT, &delta);
 				diff += delta.x >> 6;
@@ -401,7 +451,7 @@ int twrpTruetype::gr_ttf_render_text(TrueTypeFont *font, GGLSurface *surface, co
 	for(i = 0; i < char_idxs_len; ++i)
 	{
 		char_idx = char_idxs[i];
-		if(FT_HAS_KERNING(f->face) && prev_idx && char_idx)
+		if(FT_HAS_KERNING(f->face) && prev_idx > 0 && char_idx > 0)
 		{
 			FT_Get_Kerning(f->face, prev_idx, char_idx, FT_KERNING_DEFAULT, &delta);
 			x += delta.x >> 6;
@@ -438,13 +488,12 @@ StringCacheEntry* twrpTruetype::gr_ttf_string_cache_peek(TrueTypeFont *font,
 }
 
 void twrpTruetype::gr_ttf_string_cache_truncate(TrueTypeFont *font) {
-	StringCacheMap::iterator stringCacheItr;
-
-	if (font->string_cache.size() == STRING_CACHE_MAX_ENTRIES) {
+	if (font->string_cache.size() >= STRING_CACHE_MAX_ENTRIES) {
 		StringCacheEntry *truncateEntry = nullptr;
-		stringCacheItr = font->string_cache.begin();
+		StringCacheMap::iterator stringCacheItr = font->string_cache.begin();
 		int deleteCtr = 0;
-		while (stringCacheItr != font->string_cache.end() || deleteCtr == (STRING_CACHE_MAX_ENTRIES - 1)) {
+		while (stringCacheItr != font->string_cache.end() &&
+			deleteCtr < STRING_CACHE_TRUNCATE_ENTRIES) {
 			truncateEntry = stringCacheItr->second;
 			gr_ttf_freeStringCache(truncateEntry->key, truncateEntry, nullptr);
 			stringCacheItr = font->string_cache.erase(stringCacheItr);
@@ -464,6 +513,7 @@ StringCacheEntry* twrpTruetype::gr_ttf_string_cache_get(TrueTypeFont *font, cons
 
 	stringCacheItr = font->string_cache.find(k);
 	if (stringCacheItr == font->string_cache.end()) {
+		gr_ttf_string_cache_truncate(font);
 		res = new StringCacheEntry;
 		res->rendered_bytes = gr_ttf_render_text(font, &res->surface, text, max_width);
 		if(res->rendered_bytes < 0) {
@@ -489,7 +539,6 @@ int twrpTruetype::gr_ttf_measureEx(const char *s, void *font) {
 	int res = -1;
 
 	pthread_mutex_lock(&f->mutex);
-	gr_ttf_string_cache_truncate(f);
 	StringCacheEntry *e = gr_ttf_string_cache_get(f, s, -1);
 	if(e)
 		res = e->surface.width;
@@ -521,8 +570,8 @@ int twrpTruetype::gr_ttf_maxExW(const char *s, void *font, int max_width) {
 		utf_bytes = utf8_to_unicode(s, &unicode);
 		s += utf_bytes;
 
-		char_idx = FT_Get_Char_Index(f->face, unicode);
-		if(FT_HAS_KERNING(f->face) && prev_idx && char_idx)
+		char_idx = gr_ttf_get_char_index(f, unicode);
+		if(FT_HAS_KERNING(f->face) && prev_idx > 0 && char_idx > 0)
 		{
 			FT_Get_Kerning(f->face, prev_idx, char_idx, FT_KERNING_DEFAULT, &delta);
 			total_w += delta.x >> 6;

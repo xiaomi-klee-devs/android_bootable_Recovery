@@ -34,8 +34,8 @@
 	</resources>
 	
 	<variables>
-		<variable name="theme_font" value="InterDisplay"/>
-		<variable name="theme_sec_font" value="InterDisplay"/>
+		<variable name="theme_font" value="MiSans"/>
+		<variable name="theme_sec_font" value="MiSans"/>
 		<variable name="theme_font_size" value="n"/>
 		<variable name="theme_font_weight" value="2"/>
 	</variables>

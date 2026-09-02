@@ -114,7 +114,9 @@ int gr_textEx_scaleW(int x, int y, const char *s, void* pFont, int max_width, in
         else if (placement == BOTTOM_LEFT || placement == BOTTOM_RIGHT)
             y -= measured_height;
     }
-    return twrpTruetype::gr_ttf_textExWH(gl, x, y + y_scale, s, vfont, measured_width + x, -1, gr_draw);
+	// gr_ttf_measureEx() has already cached the complete string with max_width
+	// -1. Reuse that surface instead of rendering and caching every label twice.
+	return twrpTruetype::gr_ttf_textExWH(gl, x, y + y_scale, s, vfont, -1, -1, gr_draw);
 }
 
 void gr_clip(int x, int y, int w, int h)

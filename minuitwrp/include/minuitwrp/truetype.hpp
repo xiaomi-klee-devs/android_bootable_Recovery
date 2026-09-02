@@ -64,6 +64,7 @@ typedef struct {
     int max_height;
     int base;
     FT_Face face;
+    FT_Face fallback_face;
     std::map<int, TrueTypeCacheEntry*> glyph_cache;
     std::map<StringCacheKey, StringCacheEntry*> string_cache;
     pthread_mutex_t mutex;
@@ -101,6 +102,7 @@ public:
     static void gr_ttf_freeFont(void *font);
     static TrueTypeCacheEntry* gr_ttf_glyph_cache_peek(TrueTypeFont *font, int char_index);
     static TrueTypeCacheEntry* gr_ttf_glyph_cache_get(TrueTypeFont *font, int char_index);
+    static int gr_ttf_get_char_index(TrueTypeFont *font, unsigned int unicode);
     static int gr_ttf_copy_glyph_to_surface(GGLSurface *dest, FT_BitmapGlyph glyph, int offX, int offY, int base);
     static void gr_ttf_calcMaxFontHeight(TrueTypeFont *f);
     static int gr_ttf_render_text(TrueTypeFont *font, GGLSurface *surface, const std::string text, int max_width);

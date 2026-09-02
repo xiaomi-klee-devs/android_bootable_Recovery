@@ -51,6 +51,7 @@ extern "C" {
 #include "data.hpp"
 
 #include "partitions.hpp"
+#include "twrpRepacker.hpp"
 #ifdef __ANDROID_API_N__
 #include <android-base/strings.h>
 #else
@@ -251,6 +252,12 @@ static void process_recovery_mode(twrpAdbBuFifo* adb_bu_fifo, bool skip_decrypti
 #ifdef TW_INCLUDE_CRYPTO
 	android::keystore::copySqliteDb();
 #endif
+#ifdef OF_LOAD_DEFAULT_LANGUAGE_BEFORE_DECRYPT
+	// The decrypt page blocks before encrypted settings can be loaded. Apply the
+	// compiled default to the already-loaded GUI package before opening it.
+	PageManager::LoadLanguage(DataManager::GetStrValue("tw_language"));
+	GUIConsole::Translate_Now();
+#endif
 	Decrypt_Page(skip_decryption, datamedia);
 
 	// Check for and load custom theme if present
@@ -403,10 +410,12 @@ static bool Fox_CheckReload_Themes() {
   || TWFunc::Fox_Property_Get("orangefox.mount_to_decrypt") == "1") {
 	DataManager::SetValue(FOX_ENCRYPTED_DEVICE, "1");
     }
-#if defined(FOX_ALLOW_EARLY_SETTINGS_LOAD) && defined(FOX_SETTINGS_ROOT_DIRECTORY)
-  return false;
-#else
-  return (TWFunc::Path_Exists(FOX_THEME_PATH) || TWFunc::Path_Exists(FOX_NAVBAR_PATH));
+	#if defined(OF_SKIP_POST_DECRYPT_THEME_RELOAD)
+	  return false;
+	#elif defined(FOX_ALLOW_EARLY_SETTINGS_LOAD) && defined(FOX_SETTINGS_ROOT_DIRECTORY)
+	  return false;
+	#else
+	  return (TWFunc::Path_Exists(FOX_THEME_PATH) || TWFunc::Path_Exists(FOX_NAVBAR_PATH));
 #endif
 }
 
@@ -629,6 +638,14 @@ int main(int argc, char **argv) {
 		return 0;
 	} else {
 		process_recovery_mode(adb_bu_fifo, startup.Should_Skip_Decryption());
+	}
+
+	// Now that decryption (if any) is settled, cache the currently-running recovery/vendor_boot
+	// image to /tmp, right before the main menu comes up. This way "Flash Current OrangeFox"
+	// later on doesn't need to dd the partition again - it can just reuse this file.
+	if (!startup.Get_Fastboot_Mode()) {
+		twrpRepacker boot_cache_repacker;
+		boot_cache_repacker.Cache_Current_Image();
 	}
 #ifndef FOX_ALLOW_EARLY_SETTINGS_LOAD
 	// Language

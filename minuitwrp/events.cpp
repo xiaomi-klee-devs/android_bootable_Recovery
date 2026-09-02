@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <fstream>
+#include <string>
 #ifdef USE_QTI_AIDL_HAPTICS_FIX_OFF
 #include <thread>
 #endif
@@ -63,6 +64,18 @@ static std::atomic_int vib_on_count = 0;
 
 #define LEDS_HAPTICS_DURATION_FILE	"/sys/class/leds/vibrator/duration"
 #define LEDS_HAPTICS_ACTIVATE_FILE	"/sys/class/leds/vibrator/activate"
+
+// klee's AWINIC driver exposes haptics directly on its I2C device.
+#define AWINIC_HAPTIC_DURATION_FILE \
+    "/sys/bus/i2c/devices/0-005a/duration"
+#define AWINIC_HAPTIC_ACTIVATE_FILE \
+    "/sys/bus/i2c/devices/0-005a/activate"
+
+// klee's ICS driver exposes haptics directly on its I2C device.
+#define ICS_HAPTIC_DURATION_FILE \
+    "/sys/bus/i2c/devices/0-005f/duration"
+#define ICS_HAPTIC_ACTIVATE_FILE \
+    "/sys/bus/i2c/devices/0-005f/activate"
 
 #ifndef SYN_REPORT
 #define SYN_REPORT          0x00
@@ -185,8 +198,15 @@ int vibrate(int timeout_ms)
     if (std::ifstream(LEDS_HAPTICS_ACTIVATE_FILE).good()) {
         write_to_file(LEDS_HAPTICS_DURATION_FILE, tout);
         write_to_file(LEDS_HAPTICS_ACTIVATE_FILE, "1");
-    } else
+    } else if (std::ifstream(AWINIC_HAPTIC_ACTIVATE_FILE).good()) {
+        write_to_file(AWINIC_HAPTIC_DURATION_FILE, tout);
+        write_to_file(AWINIC_HAPTIC_ACTIVATE_FILE, "1");
+    } else if (std::ifstream(ICS_HAPTIC_ACTIVATE_FILE).good()) {
+        write_to_file(ICS_HAPTIC_DURATION_FILE, tout);
+        write_to_file(ICS_HAPTIC_ACTIVATE_FILE, "1");
+    } else {
         write_to_file(VIBRATOR_TIMEOUT_FILE, tout);
+    }
 #endif
     return 0;
 }

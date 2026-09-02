@@ -55,6 +55,7 @@
 		<font name="font5" filename="FiraCode-Regular.ttf" size="42"/>
 		<font name="font6" filename="Exo2-Regular.ttf" size="42"/>
 		<font name="font7" filename="InterDisplay-Regular.ttf" size="42"/>
+		<font name="font8" filename="MiSans.ttf" size="42"/>
 		
 		<font name="orangefont" filename="InterDisplay-Regular.ttf" size="42"/>
 		<font name="about" filename="InterDisplay-Medium.ttf" size="58"/>

@@ -12,12 +12,9 @@ bool twrpApex::loadApexImages() {
 	char* additionalApexFiles = std::strtok(additionalFiles, " ");
 #endif
 
-	apexFiles.push_back(APEX_DIR "/com.android.apex.cts.shim.apex");
 	apexFiles.push_back(APEX_DIR "/com.google.android.tzdata2.apex");
-	apexFiles.push_back(APEX_DIR "/com.android.tzdata.apex");
 	apexFiles.push_back(APEX_DIR "/com.android.art.release.apex");
 	apexFiles.push_back(APEX_DIR "/com.google.android.media.swcodec.apex");
-	apexFiles.push_back(APEX_DIR "/com.android.media.swcodec.apex");
 
 #ifdef TW_ADDITIONAL_APEX_FILES
 	while(additionalApexFiles) {
@@ -116,7 +113,9 @@ bool twrpApex::mountApexOnLoopbackDevices(std::vector<std::string> apexFiles) {
 		}
 		bool load_result = loadApexImage(fileToMount, device_no);
 		if (!load_result) {
-			return false;
+			LOGINFO("Skipping apex that failed to load: %s\n", fileToMount.c_str());
+			device_no++;
+			continue;
 		}
 		device_no++;
 	}
