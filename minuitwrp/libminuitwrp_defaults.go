@@ -79,6 +79,10 @@ func globalFlags(ctx android.BaseContext) []string {
 	case "BGRA_8888":
 		cflags = append(cflags, "-DRECOVERY_BGRA")
 		break
+
+	case "RGB_565":
+		cflags = append(cflags, "-DRECOVERY_FORCE_RGB_565")
+		break
 	}
 
 	var tw_rotation = getMakeVars(ctx, "TW_ROTATION")
