@@ -479,8 +479,17 @@ static InstallResult TryUpdateBinary(Package* package, bool* wipe_cache,
     return INSTALL_CORRUPT;
   }
 
+  // Mark the update_engine_sideload (or legacy update-binary) subprocess as active so that
+  // concurrent GUI-triggered partition-size refreshes (TWPartitionManager::Update_System_Details,
+  // e.g. from page-transition onload actions) skip remounting system/vendor/product read-write
+  // while this subprocess is issuing device-mapper table loads for the target slot. Without this,
+  // the two can race for the device-mapper lock and the kernel returns -EBUSY, which aborts the
+  // A/B snapshot setup within a couple seconds (kInstallDeviceOpenError / "Error applying update: 7").
+  android::base::SetProperty("ofox.sideload.active", "1");
+
   pid_t pid = fork();
   if (pid == -1) {
+    android::base::SetProperty("ofox.sideload.active", "0");
     PLOG(ERROR) << "Failed to fork update binary";
     log_buffer->push_back(android::base::StringPrintf("error: %d", kForkUpdateBinaryFailure));
     return INSTALL_ERROR;
@@ -565,6 +574,7 @@ static InstallResult TryUpdateBinary(Package* package, bool* wipe_cache,
 
   int status;
   waitpid(pid, &status, 0);
+  android::base::SetProperty("ofox.sideload.active", "0");
 
   logger_finished.store(true);
   finish_log_temperature.notify_one();

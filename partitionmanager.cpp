@@ -2084,6 +2084,22 @@ int TWPartitionManager::Resize_By_Path(string Path, bool Display_Error) {
 }
 
 void TWPartitionManager::Update_System_Details(void) {
+	// Guard against racing with an active A/B/VAB sideload install. GUI page transitions
+	// trigger this function (via refreshsizes/onload actions) to recompute free-space and
+	// backup-size stats, which remounts system/vendor/product read-write per partition. If
+	// that remount happens while update_engine_sideload is concurrently issuing DM_TABLE_LOAD
+	// for the target-slot dm-linear/cow tables, both sides race for the device-mapper lock and
+	// the kernel returns -EBUSY, aborting the snapshot setup almost immediately
+	// (kInstallDeviceOpenError / "Error applying update: 7"). Skip the refresh entirely while
+	// a sideload/update_engine install is in flight; ofox.sideload.active is set by
+	// TryUpdateBinary() in install/install.cpp for the duration of the update_engine_sideload
+	// subprocess only, so this never suppresses the legitimate post-flash refresh that runs
+	// after the subprocess has already exited.
+	if (android::base::GetBoolProperty("ofox.sideload.active", false)) {
+		LOGINFO("Update_System_Details: skipping partition size refresh - sideload/OTA install in progress\n");
+		return;
+	}
+
 	std::vector<TWPartition*>::iterator iter;
 	int data_size = 0;
   	#ifdef OF_REPORT_HARMLESS_MOUNT_ISSUES
