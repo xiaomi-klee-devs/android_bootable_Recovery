@@ -19,6 +19,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <png.h>
 #include <pixelflinger/pixelflinger.h>
 #include <linux/fb.h>
@@ -47,41 +48,6 @@ int gr_save_screenshot(const char *dest)
     if(!fp)
         goto exit;
 
-    img_data = (uint8_t *)malloc(gr_mem_surface.stride * gr_mem_surface.height * 4);
-    if (!img_data) {
-        printf("gr_save_screenshot failed to malloc img_data\n");
-        goto exit;
-    }
-    surface.version = sizeof(surface);
-    surface.width = gr_mem_surface.width;
-    surface.height = gr_mem_surface.height;
-    surface.stride = gr_mem_surface.stride;
-    surface.data = img_data;
-
-#if defined(RECOVERY_BGRA)
-    surface.format = GGL_PIXEL_FORMAT_BGRA_8888;
-#else
-    surface.format = GGL_PIXEL_FORMAT_RGBA_8888;
-#endif
-
-    gglInit(&gl);
-    gl->colorBuffer(gl, &surface);
-    gl->activeTexture(gl, 0);
-
-    if(gr_mem_surface.format == GGL_PIXEL_FORMAT_RGBX_8888)
-        gl->disable(gl, GGL_BLEND);
-
-    gl->bindTexture(gl, &gr_mem_surface);
-    gl->texEnvi(gl, GGL_TEXTURE_ENV, GGL_TEXTURE_ENV_MODE, GGL_REPLACE);
-    gl->texGeni(gl, GGL_S, GGL_TEXTURE_GEN_MODE, GGL_ONE_TO_ONE);
-    gl->texGeni(gl, GGL_T, GGL_TEXTURE_GEN_MODE, GGL_ONE_TO_ONE);
-    gl->enable(gl, GGL_TEXTURE_2D);
-    gl->texCoord2i(gl, 0, 0);
-    gl->recti(gl, 0, 0, gr_mem_surface.width, gr_mem_surface.height);
-
-    gglUninit(gl);
-    gl = NULL;
-
     png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
     if (!png_ptr)
         goto exit;
@@ -94,20 +60,90 @@ int gr_save_screenshot(const char *dest)
         goto exit;
 
     png_init_io(png_ptr, fp);
-    png_set_IHDR(png_ptr, info_ptr, surface.width, surface.height,
+    png_set_IHDR(png_ptr, info_ptr, gr_mem_surface.width, gr_mem_surface.height,
          8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
          PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
     png_write_info(png_ptr, info_ptr);
 
-    // To remove the alpha channel for PNG_COLOR_TYPE_RGB format,
-    png_set_filler(png_ptr, 0, PNG_FILLER_AFTER);
+    if (gr_mem_surface.format == GGL_PIXEL_FORMAT_RGB_565) {
+        // gr_mem_surface is native 16-bit RGB565 on this device (see
+        // TARGET_RECOVERY_PIXEL_FORMAT := "RGB_565"). Routing this through
+        // the pixelflinger/GGL texture blit below to convert to RGBA_8888
+        // is what produced a red/blue-swapped, blue-dominant PNG. Unpack
+        // the 565 pixels to RGB888 by hand instead, bypassing GGL entirely
+        // for this format.
+        uint8_t *row_rgb = (uint8_t *)malloc(gr_mem_surface.width * 3);
+        if (!row_rgb) {
+            printf("gr_save_screenshot failed to malloc row_rgb\n");
+            goto exit;
+        }
+        for (y = 0; y < (uint32_t)gr_mem_surface.height; ++y) {
+            const uint16_t *src = (const uint16_t *)
+                (gr_mem_surface.data + y * gr_mem_surface.stride * 2);
+            for (uint32_t x = 0; x < (uint32_t)gr_mem_surface.width; ++x) {
+                uint16_t px = src[x];
+                uint8_t r5 = (px >> 11) & 0x1F;
+                uint8_t g6 = (px >> 5)  & 0x3F;
+                uint8_t b5 =  px        & 0x1F;
+                row_rgb[x * 3 + 0] = (uint8_t)((r5 << 3) | (r5 >> 2));
+                row_rgb[x * 3 + 1] = (uint8_t)((g6 << 2) | (g6 >> 4));
+                row_rgb[x * 3 + 2] = (uint8_t)((b5 << 3) | (b5 >> 2));
+            }
+            png_write_row(png_ptr, row_rgb);
+        }
+        free(row_rgb);
+    } else {
+        img_data = (uint8_t *)malloc(gr_mem_surface.stride * gr_mem_surface.height * 4);
+        if (!img_data) {
+            printf("gr_save_screenshot failed to malloc img_data\n");
+            goto exit;
+        }
+        surface.version = sizeof(surface);
+        surface.width = gr_mem_surface.width;
+        surface.height = gr_mem_surface.height;
+        surface.stride = gr_mem_surface.stride;
+        surface.data = img_data;
 
-    ptr = img_data;
-    stride_bytes = surface.stride*4;
-    for(y = 0; y < surface.height; ++y)
-    {
-        png_write_row(png_ptr, ptr);
-        ptr += stride_bytes;
+#if defined(RECOVERY_BGRA)
+        surface.format = GGL_PIXEL_FORMAT_BGRA_8888;
+#else
+        surface.format = GGL_PIXEL_FORMAT_RGBA_8888;
+#endif
+
+        gglInit(&gl);
+        gl->colorBuffer(gl, &surface);
+        gl->activeTexture(gl, 0);
+
+        if(gr_mem_surface.format == GGL_PIXEL_FORMAT_RGBX_8888)
+            gl->disable(gl, GGL_BLEND);
+
+        gl->bindTexture(gl, &gr_mem_surface);
+        gl->texEnvi(gl, GGL_TEXTURE_ENV, GGL_TEXTURE_ENV_MODE, GGL_REPLACE);
+        gl->texGeni(gl, GGL_S, GGL_TEXTURE_GEN_MODE, GGL_ONE_TO_ONE);
+        gl->texGeni(gl, GGL_T, GGL_TEXTURE_GEN_MODE, GGL_ONE_TO_ONE);
+        gl->enable(gl, GGL_TEXTURE_2D);
+        gl->texCoord2i(gl, 0, 0);
+        gl->recti(gl, 0, 0, gr_mem_surface.width, gr_mem_surface.height);
+
+        gglUninit(gl);
+        gl = NULL;
+
+#if defined(RECOVERY_BGRA)
+        // Destination byte order is B,G,R,A; PNG_COLOR_TYPE_RGB expects
+        // R,G,B, so tell libpng to swap it back on write.
+        png_set_bgr(png_ptr);
+#endif
+
+        // To remove the alpha channel for PNG_COLOR_TYPE_RGB format,
+        png_set_filler(png_ptr, 0, PNG_FILLER_AFTER);
+
+        ptr = img_data;
+        stride_bytes = surface.stride*4;
+        for(y = 0; y < surface.height; ++y)
+        {
+            png_write_row(png_ptr, ptr);
+            ptr += stride_bytes;
+        }
     }
 
     png_write_end(png_ptr, NULL);
