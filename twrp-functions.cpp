@@ -2593,8 +2593,46 @@ int TWFunc::Check_MIUI_Treble(void)
   // is the device encrypted?
   if (StorageIsEncrypted())
       gui_msg(Msg(msg::kHighlight, "fox_encrypted=* Storage is encrypted"));
-  else
+  else {
       gui_msg(Msg(msg::kWarning, "fox_unencrypted=* Storage is not encrypted"));
+
+      // Workaround: when storage is not encrypted, /sdcard symlinks to /data/media
+      // (not /data/media/0). Fox_Home = "/sdcard/Fox" resolves to /data/media/Fox,
+      // but user data lives at /data/media/0. Files placed in /data/media/Fox are
+      // invisible to Android and disappear after reboot. Redirect to /data/media/0/Fox.
+      std::string data_media_0 = "/data/media/0";
+      if (TWFunc::Path_Exists(data_media_0)) {
+          std::string fox_home_0 = data_media_0 + "/Fox";
+          std::string old_fox = "/data/media/Fox";
+
+          // move any stale /data/media/Fox into /data/media/0/Fox
+          if (TWFunc::Path_Exists(old_fox) && !TWFunc::Path_Exists(fox_home_0)) {
+              TWFunc::Exec_Cmd("mv " + old_fox + " " + fox_home_0, true);
+          }
+
+          if (!TWFunc::Path_Exists(fox_home_0))
+              TWFunc::Create_Dir_Recursive(fox_home_0, 0777, AID_MEDIA_RW, AID_MEDIA_RW);
+
+          // redirect /sdcard/Fox -> /data/media/0/Fox if not already
+          struct stat st;
+          bool needs_redirect = true;
+          if (lstat(Fox_Home.c_str(), &st) == 0 && S_ISLNK(st.st_mode)) {
+              char buf[256];
+              ssize_t len = readlink(Fox_Home.c_str(), buf, sizeof(buf) - 1);
+              if (len > 0) {
+                  buf[len] = '\0';
+                  if (std::string(buf) == fox_home_0)
+                      needs_redirect = false;
+              }
+          }
+          if (needs_redirect) {
+              if (TWFunc::Path_Exists(Fox_Home))
+                  unlink(Fox_Home.c_str());
+              symlink(fox_home_0.c_str(), Fox_Home.c_str());
+              LOGINFO("Fox home redirected: %s -> %s\n", Fox_Home.c_str(), fox_home_0.c_str());
+          }
+      }
+  }
 
 #ifdef PRODUCT_PLATFORM
   gui_msg(Msg("fox_platform=* Platform:   {1}")(EXPAND(PRODUCT_PLATFORM)));
