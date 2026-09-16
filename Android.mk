@@ -630,6 +630,9 @@ endif
 ifneq ($(TARGET_RECOVERY_DEVICE_MODULES),)
     TWRP_REQUIRED_MODULES += $(TARGET_RECOVERY_DEVICE_MODULES)
 endif
+# Default to including NTFS-3G (needed for NTFS-formatted USB-OTG storage) unless
+# a device's BoardConfig.mk explicitly sets TW_INCLUDE_NTFS_3G := false.
+TW_INCLUDE_NTFS_3G ?= true
 ifeq ($(TW_INCLUDE_NTFS_3G),true)
     TWRP_REQUIRED_MODULES += \
         mount.ntfs \
