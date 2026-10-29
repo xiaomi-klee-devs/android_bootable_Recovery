@@ -42,7 +42,9 @@ bool Same_Image(const std::string& first, const std::string& second);
 bool Is_Vendor_Boot_V4(const std::string& path);
 
 // Builds "output_image" from:
-//   - every non-RECOVERY ramdisk entry (and the header fields) of stock_image
+//   - every non-RECOVERY ramdisk entry (and the header fields) of stock_image;
+//     lz4 PLATFORM ramdisks are unpacked, stripped of the files that OrangeFox
+//     ships in its own RECOVERY fragment, and compressed again
 //   - the RECOVERY ramdisk entry of orangefox_image
 //   - the DTB of orangefox_image
 // The result is padded with zeroes up to pad_to_size bytes (pass 0 to skip),

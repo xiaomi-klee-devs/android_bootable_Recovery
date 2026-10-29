@@ -21,6 +21,8 @@
 
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <lz4.h>
+#include <lz4hc.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -29,7 +31,9 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vbm {
@@ -40,8 +44,46 @@ constexpr uint32_t kHeaderV4Size = 2128;
 constexpr uint32_t kTableEntrySize = 108;
 constexpr uint32_t kRamdiskNameSize = 32;
 constexpr uint32_t kBoardIdWords = 16;
+constexpr uint32_t kTypePlatform = 1;
 constexpr uint32_t kTypeRecovery = 2;
 constexpr size_t kCopyBufferSize = 1024 * 1024;
+
+// Legacy lz4 stream ("lz4 -l"), the format used by Android ramdisks: a 4-byte
+// magic followed by blocks of "4-byte little-endian compressed size + data",
+// each block decompressing to at most 8 MiB.
+constexpr uint32_t kLz4LegacyMagic = 0x184C2102;
+constexpr int kLz4LegacyBlockSize = 8 * 1024 * 1024;
+constexpr int kLz4CompressionLevel = 12;
+
+// Files/directories that the OrangeFox build removes from the stock PLATFORM
+// ramdisk (see tools/build-system-compatible-vendor-boot.sh). The recovery
+// ramdisk fragment ships its own copies, so keeping the ROM ones would only
+// waste space and can shadow the OrangeFox versions depending on merge order.
+constexpr const char* kPrunedPaths[] = {
+	"miui.factoryreset.rc",
+	"system/bin/adbd",
+	"system/bin/fastbootd",
+	"system/bin/logcat",
+	"system/bin/logd",
+	"system/bin/recovery",
+	"system/bin/servicemanager",
+	"system/bin/sh",
+	"system/bin/toolbox",
+	"system/bin/toybox",
+	"system/bin/update_engine_sideload",
+	"system/bin/hw/android.hardware.boot-service.mtk_recovery",
+	"system/bin/hw/android.hardware.health-service.example_recovery",
+	"system/etc/init/android.hardware.boot-service.mtk_recovery.rc",
+	"system/etc/init/android.hardware.health-service.example_recovery.rc",
+	"system/etc/init/recovery-persist.rc",
+	"system/etc/init/recovery-refresh.rc",
+	"system/etc/init/servicemanager.recovery.rc",
+	"system/etc/recovery.fstab",
+	"system/etc/security/otacerts.zip",
+	"system/etc/vintf/manifest/android.hardware.boot-service.mtk.xml",
+	"system/etc/vintf/manifest/android.hardware.health-service.example.xml",
+	"system/lib64/librecovery_ui.so",
+};
 
 struct Header {
 	uint32_t header_version = 0;
@@ -274,6 +316,16 @@ const Table_Entry* Find_Recovery_Entry(const Image& image) {
 	return nullptr;
 }
 
+bool Has_Lz4_Legacy_Magic(const Image& image, const Table_Entry& entry) {
+	if (entry.size < 8)
+		return false;
+	uint8_t magic[4];
+	std::string ignored;
+	if (!image.Read(image.Ramdisk_Base() + entry.offset, magic, sizeof(magic), ignored))
+		return false;
+	return Get_U32(magic) == kLz4LegacyMagic;
+}
+
 bool Copy_Data(int source_fd, const std::string& source_path, uint64_t source_offset,
                uint64_t length, int destination_fd, std::string& error) {
 	std::vector<uint8_t> buffer(kCopyBufferSize);
@@ -341,10 +393,238 @@ bool Pad_To_Page(int fd, uint32_t page_size, std::string& error) {
 	return Write_Zeroes(fd, page_size - remainder, error);
 }
 
+bool Write_All(int fd, const void* data, size_t length, std::string& error) {
+	const uint8_t* bytes = static_cast<const uint8_t*>(data);
+	size_t done = 0;
+	while (done < length) {
+		ssize_t result = write(fd, bytes + done, length - done);
+		if (result < 0) {
+			if (errno == EINTR) continue;
+			error = "failed to write the merged image: " + std::string(strerror(errno));
+			return false;
+		}
+		done += static_cast<size_t>(result);
+	}
+	return true;
+}
+
+bool Parse_Cpio_Hex(const uint8_t* data, uint32_t& value) {
+	value = 0;
+	for (int i = 0; i < 8; ++i) {
+		uint8_t c = data[i];
+		uint32_t digit;
+		if (c >= '0' && c <= '9')
+			digit = c - '0';
+		else if (c >= 'a' && c <= 'f')
+			digit = c - 'a' + 10;
+		else if (c >= 'A' && c <= 'F')
+			digit = c - 'A' + 10;
+		else
+			return false;
+		value = (value << 4) | digit;
+	}
+	return true;
+}
+
+std::string Normalize_Cpio_Path(std::string name) {
+	while (name.rfind("./", 0) == 0)
+		name.erase(0, 2);
+	while (!name.empty() && name[0] == '/')
+		name.erase(0, 1);
+	return name;
+}
+
+bool Is_Pruned_Cpio_Path(const std::string& name) {
+	if (name == "res" || name.compare(0, 4, "res/") == 0)
+		return true;
+	for (const char* path : kPrunedPaths) {
+		if (name == path)
+			return true;
+	}
+	return false;
+}
+
+// Copies a newc/crc cpio archive while dropping the files that the OrangeFox
+// build also removes from the stock PLATFORM ramdisk. Entries are copied
+// verbatim, so permissions, symlinks, inode numbers and SELinux xattrs are all
+// preserved and there is no need to regenerate cpio headers.
+bool Prune_Cpio(const std::vector<uint8_t>& input, std::vector<uint8_t>& output,
+                std::string& error) {
+	output.clear();
+	size_t position = 0;
+	bool saw_trailer = false;
+	while (position + 110 <= input.size()) {
+		const uint8_t* header = input.data() + position;
+		if (memcmp(header, "070701", 6) != 0 && memcmp(header, "070702", 6) != 0) {
+			error = "invalid cpio header magic";
+			return false;
+		}
+
+		uint32_t namesize = 0;
+		uint32_t filesize = 0;
+		if (!Parse_Cpio_Hex(header + 94, namesize) ||
+		    !Parse_Cpio_Hex(header + 54, filesize)) {
+			error = "invalid cpio header field";
+			return false;
+		}
+		if (namesize == 0) {
+			error = "invalid cpio file name size";
+			return false;
+		}
+
+		uint64_t name_end = static_cast<uint64_t>(position) + 110 + namesize;
+		uint64_t data_start = (name_end + 3) & ~static_cast<uint64_t>(3);
+		uint64_t entry_end =
+		    (data_start + filesize + 3) & ~static_cast<uint64_t>(3);
+		if (entry_end > input.size()) {
+			error = "truncated cpio entry";
+			return false;
+		}
+
+		size_t name_length = strnlen(reinterpret_cast<const char*>(header + 110),
+		                             namesize);
+		std::string name = Normalize_Cpio_Path(
+		    std::string(reinterpret_cast<const char*>(header + 110), name_length));
+
+		if (!Is_Pruned_Cpio_Path(name)) {
+			output.insert(output.end(), input.begin() + position,
+			              input.begin() + entry_end);
+		}
+
+		position = static_cast<size_t>(entry_end);
+		if (name == "TRAILER!!!") {
+			saw_trailer = true;
+			break;
+		}
+	}
+
+	if (!saw_trailer) {
+		error = "cpio archive has no trailer";
+		return false;
+	}
+	return true;
+}
+
+bool Decompress_Lz4_Legacy(const Image& source, const Table_Entry& entry,
+                           std::vector<uint8_t>& output, std::string& error) {
+	output.clear();
+	if (entry.size < sizeof(uint32_t)) {
+		error = "lz4 ramdisk of " + source.path + " is too small";
+		return false;
+	}
+
+	uint8_t magic[4];
+	if (!source.Read(source.Ramdisk_Base() + entry.offset, magic, sizeof(magic), error))
+		return false;
+	if (Get_U32(magic) != kLz4LegacyMagic) {
+		error = "ramdisk of " + source.path + " is not a legacy lz4 stream";
+		return false;
+	}
+
+	std::vector<char> compressed(
+	    static_cast<size_t>(LZ4_compressBound(kLz4LegacyBlockSize)));
+	std::vector<char> uncompressed(static_cast<size_t>(kLz4LegacyBlockSize));
+	uint64_t position = sizeof(uint32_t);
+	while (position < entry.size) {
+		if (entry.size - position < sizeof(uint32_t)) {
+			error = "truncated lz4 block header in " + source.path;
+			return false;
+		}
+		uint8_t size_data[4];
+		if (!source.Read(source.Ramdisk_Base() + entry.offset + position,
+		                 size_data, sizeof(size_data), error))
+			return false;
+		uint32_t block_size = Get_U32(size_data);
+		position += sizeof(uint32_t);
+		if (block_size == 0)
+			break;
+		if (block_size > entry.size - position) {
+			error = "truncated lz4 block in " + source.path;
+			return false;
+		}
+		if (block_size > compressed.size()) {
+			error = "unsupported lz4 block size in " + source.path;
+			return false;
+		}
+		if (!source.Read(source.Ramdisk_Base() + entry.offset + position,
+		                 compressed.data(), block_size, error))
+			return false;
+		position += block_size;
+
+		int unpacked = LZ4_decompress_safe(compressed.data(), uncompressed.data(),
+		                                   static_cast<int>(block_size),
+		                                   kLz4LegacyBlockSize);
+		if (unpacked < 0) {
+			error = "cannot decompress the lz4 ramdisk of " + source.path;
+			return false;
+		}
+		if (output.size() > SIZE_MAX - static_cast<size_t>(unpacked)) {
+			error = "decompressed lz4 ramdisk is too large";
+			return false;
+		}
+		output.insert(output.end(), uncompressed.data(),
+		              uncompressed.data() + unpacked);
+	}
+	return true;
+}
+
+bool Compress_Lz4_Legacy(const std::vector<uint8_t>& input,
+                         std::vector<uint8_t>& output, std::string& error) {
+	output.clear();
+	output.reserve(input.size() / 2 + 64);
+
+	uint8_t magic[4];
+	Put_U32(magic, kLz4LegacyMagic);
+	output.insert(output.end(), magic, magic + sizeof(magic));
+
+	std::vector<char> compressed(
+	    static_cast<size_t>(LZ4_compressBound(kLz4LegacyBlockSize)));
+	size_t position = 0;
+	while (position < input.size()) {
+		size_t chunk = std::min<size_t>(kLz4LegacyBlockSize,
+		                                input.size() - position);
+		int packed = LZ4_compress_HC(
+		    reinterpret_cast<const char*>(input.data() + position),
+		    compressed.data(), static_cast<int>(chunk),
+		    static_cast<int>(compressed.size()), kLz4CompressionLevel);
+		if (packed <= 0) {
+			error = "cannot recompress the pruned platform ramdisk";
+			return false;
+		}
+		uint8_t packed_size[4];
+		Put_U32(packed_size, static_cast<uint32_t>(packed));
+		output.insert(output.end(), packed_size, packed_size + sizeof(packed_size));
+		output.insert(output.end(), compressed.data(),
+		              compressed.data() + static_cast<size_t>(packed));
+		position += chunk;
+	}
+	return true;
+}
+
+// Decompresses a PLATFORM ramdisk, drops the files that OrangeFox ships in its
+// own RECOVERY fragment, and compresses the result again. Recompressing at the
+// same high level as the build is what keeps the merged image inside the
+// vendor_boot partition even when the ROM used a fast lz4 level.
+bool Build_Pruned_Platform(const Image& source, const Table_Entry& entry,
+                           std::vector<uint8_t>& output, std::string& error) {
+	std::vector<uint8_t> cpio;
+	if (!Decompress_Lz4_Legacy(source, entry, cpio, error))
+		return false;
+	std::vector<uint8_t> pruned;
+	if (!Prune_Cpio(cpio, pruned, error))
+		return false;
+	// The uncompressed source is no longer needed; release it before
+	// compressing so recovery does not have to keep two large buffers.
+	std::vector<uint8_t>().swap(cpio);
+	return Compress_Lz4_Legacy(pruned, output, error);
+}
+
 struct Output_Entry {
-	const Image* image;
+	const Image* image = nullptr;
 	Table_Entry entry;
-	uint64_t source_offset;
+	uint64_t source_offset = 0;
+	bool use_blob = false;
+	std::vector<uint8_t> blob;
 };
 
 bool Write_Header(int fd, const Header& header, uint32_t page_size, std::string& error) {
@@ -369,7 +649,8 @@ bool Write_Header(int fd, const Header& header, uint32_t page_size, std::string&
 
 	size_t written = 0;
 	while (written < data.size()) {
-		ssize_t result = write(fd, data.data() + written, data.size() - written);
+		ssize_t result = pwrite(fd, data.data() + written, data.size() - written,
+		                        static_cast<off_t>(written));
 		if (result < 0) {
 			if (errno == EINTR) continue;
 			error = "failed to write the merged header: " + std::string(strerror(errno));
@@ -473,34 +754,42 @@ bool Merge_Vendor_Boot(const std::string& stock_image,
 	}
 
 	std::vector<Output_Entry> output_entries;
-	uint64_t total_ramdisk_size = 0;
-	auto add_entry = [&output_entries, &total_ramdisk_size](const Image* image,
-	                                                       Table_Entry entry) {
-		// Offsets in the table are relative to the start of the ramdisk area,
-		// so they have to be rebuilt for the merged layout.
-		uint64_t source_offset = image->Ramdisk_Base() + entry.offset;
-		entry.offset = static_cast<uint32_t>(total_ramdisk_size);
-		output_entries.push_back({image, entry, source_offset});
-		total_ramdisk_size += entry.size;
-	};
 	for (const auto& entry : stock.entries) {
 		if (entry.type == kTypeRecovery)
 			continue;
-		add_entry(&stock, entry);
+		Output_Entry output;
+		output.image = &stock;
+		output.entry = entry;
+		// Offsets in the table are relative to the start of the ramdisk area,
+		// so they are rebuilt while the merged blobs are written.
+		output.source_offset = stock.Ramdisk_Base() + entry.offset;
+		if (entry.type == kTypePlatform && Has_Lz4_Legacy_Magic(stock, entry)) {
+			std::string prune_error;
+			std::vector<uint8_t> blob;
+			// Older/third-party images might have a platform ramdisk that is
+			// not valid cpio; copy it verbatim in that case.
+			if (Build_Pruned_Platform(stock, entry, blob, prune_error) &&
+			    blob.size() <= UINT32_MAX) {
+				output.entry.size = static_cast<uint32_t>(blob.size());
+				output.blob = std::move(blob);
+				output.use_blob = true;
+			}
+		}
+		output_entries.push_back(std::move(output));
 	}
-	add_entry(&orangefox, *recovery);
+	Output_Entry recovery_output;
+	recovery_output.image = &orangefox;
+	recovery_output.entry = *recovery;
+	recovery_output.source_offset =
+	    orangefox.Ramdisk_Base() + recovery->offset;
+	output_entries.push_back(std::move(recovery_output));
 
-	if (total_ramdisk_size == 0 || total_ramdisk_size > UINT32_MAX) {
-		error = "invalid merged vendor ramdisk size";
-		return false;
-	}
 	if (output_entries.size() > UINT32_MAX / kTableEntrySize) {
 		error = "too many vendor ramdisk entries";
 		return false;
 	}
 
 	Header header = stock.header;
-	header.vendor_ramdisk_size = static_cast<uint32_t>(total_ramdisk_size);
 	header.dtb_size = orangefox.header.dtb_size;
 	if (header.dtb_addr == 0)
 		header.dtb_addr = orangefox.header.dtb_addr;
@@ -515,18 +804,47 @@ bool Merge_Vendor_Boot(const std::string& stock_image,
 		return false;
 	}
 
-	bool ok = Write_Header(output_fd, header, header.page_size, error);
-	if (ok) {
-		for (const auto& entry : output_entries) {
-			ok = Copy_Data(entry.image->fd, entry.image->path,
-			               entry.source_offset,
-			               entry.entry.size, output_fd, error);
-			if (!ok)
-				break;
+	// The header is written last, once the merged blob sizes are known, so
+	// reserve its space here.
+	uint64_t header_pages = (header.header_size + header.page_size - 1) / header.page_size;
+	uint64_t header_size = static_cast<uint64_t>(header_pages) * header.page_size;
+	bool ok = ftruncate(output_fd, static_cast<off_t>(header_size)) == 0 &&
+	          lseek(output_fd, static_cast<off_t>(header_size), SEEK_SET) >= 0;
+	if (!ok)
+		error = "failed to reserve the merged header: " + std::string(strerror(errno));
+
+	uint64_t ramdisk_size = 0;
+	for (auto& entry : output_entries) {
+		if (!ok)
+			break;
+		if (ramdisk_size > UINT32_MAX) {
+			error = "invalid merged vendor ramdisk size";
+			ok = false;
+			break;
 		}
+		entry.entry.offset = static_cast<uint32_t>(ramdisk_size);
+		Table_Entry source_entry = entry.entry;
+		uint64_t written = 0;
+		if (entry.use_blob) {
+			written = entry.blob.size();
+			ok = Write_All(output_fd, entry.blob.data(), entry.blob.size(), error);
+			if (ok)
+				entry.entry.size = static_cast<uint32_t>(written);
+		} else {
+			ok = Copy_Data(entry.image->fd, entry.image->path, entry.source_offset,
+			               source_entry.size, output_fd, error);
+			written = source_entry.size;
+		}
+		ramdisk_size += written;
 	}
-	if (ok)
+	if (ok && (ramdisk_size == 0 || ramdisk_size > UINT32_MAX)) {
+		error = "invalid merged vendor ramdisk size";
+		ok = false;
+	}
+	if (ok) {
+		header.vendor_ramdisk_size = static_cast<uint32_t>(ramdisk_size);
 		ok = Pad_To_Page(output_fd, header.page_size, error);
+	}
 	if (ok)
 		ok = Copy_Data(orangefox.fd, orangefox.path, orangefox.Dtb_Offset(),
 		               orangefox.header.dtb_size, output_fd, error);
@@ -564,11 +882,16 @@ bool Merge_Vendor_Boot(const std::string& stock_image,
 		if (ok)
 			ok = Pad_To_Page(output_fd, header.page_size, error);
 	}
+	if (ok)
+		ok = Write_Header(output_fd, header, header.page_size, error);
 
 	if (ok && pad_to_size > 0) {
 		off_t position = lseek(output_fd, 0, SEEK_END);
 		if (position < 0 || static_cast<uint64_t>(position) > pad_to_size) {
-			error = "the merged image does not fit in " + std::to_string(pad_to_size) + " bytes";
+			error = "the merged image needs " +
+			        std::to_string(position < 0 ? 0 : position) +
+			        " bytes but the vendor_boot partition only has " +
+			        std::to_string(pad_to_size);
 			ok = false;
 		} else if (ftruncate(output_fd, static_cast<off_t>(pad_to_size)) != 0) {
 			error = "failed to pad the merged image: " + std::string(strerror(errno));
