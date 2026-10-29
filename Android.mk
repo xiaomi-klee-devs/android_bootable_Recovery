@@ -55,7 +55,8 @@ LOCAL_SRC_FILES := \
     openrecoveryscript.cpp \
     tarWrite.c \
     twrpAdbBuFifo.cpp \
-    twrpRepacker.cpp
+    twrpRepacker.cpp \
+    vendor_boot_merge.cpp
 
 ifeq ($(TW_EXCLUDE_APEX),)
     LOCAL_SRC_FILES += twrpApex.cpp

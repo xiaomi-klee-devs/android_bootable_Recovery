@@ -20,6 +20,8 @@
 */
 
 #include <string>
+#include <cstdint>
+#include <unistd.h>
 
 #include "data.hpp"
 #include "partitions.hpp"
@@ -27,6 +29,7 @@
 #include "twrpRepacker.hpp"
 #include "twcommon.h"
 #include "variables.h"
+#include "vendor_boot_merge.hpp"
 #include "gui/gui.hpp"
 
 bool twrpRepacker::Prepare_Empty_Folder(const std::string& Folder) {
@@ -403,12 +406,38 @@ bool twrpRepacker::Flash_Current_Twrp() {
 		DataManager::SetValue("tw_flash_partition", dest_partition + ";");
 		std::string current_slot = PartitionManager.Get_Active_Slot_Display();
 
-		bool ok = PartitionManager.Flash_Image(tmp_path, tmp_filename);
+		std::string flash_path = tmp_path;
+		std::string flash_filename = tmp_filename;
+#if defined(BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT) || defined(FOX_VENDOR_BOOT_RECOVERY)
+		// If the user flashed the vendor_boot image of their ROM over the OrangeFox one,
+		// rebuild a complete image: the PLATFORM ramdisk of that ROM, plus the RECOVERY
+		// ramdisk fragment and DTB of the OrangeFox image cached at boot.
+		if (dest_partition == "/vendor_boot" && !vbm::Same_Image(src, tmp_full)) {
+			std::string merged_filename = dest_partition.substr(1) + "-merged.img";
+			std::string merged_full = tmp_path + "/" + merged_filename;
+			std::string merge_error;
+			uint64_t partition_size = vbm::Get_Image_Size(src);
+			LOGINFO("Merging the ROM platform ramdisk from '%s' with the cached image '%s'\n", src.c_str(), tmp_full.c_str());
+			if (vbm::Merge_Vendor_Boot(src, tmp_full, merged_full, partition_size, merge_error)) {
+				LOGINFO("Built the merged vendor_boot image at '%s'\n", merged_full.c_str());
+				gui_print("Merged the installed ROM vendor_boot with OrangeFox\n\n");
+				flash_path = tmp_path;
+				flash_filename = merged_filename;
+			} else {
+				LOGERR("Could not merge the installed ROM vendor_boot image: %s\n", merge_error.c_str());
+				gui_print("Could not merge the installed ROM vendor_boot image\nFalling back to the cached OrangeFox image\n\n");
+			}
+		}
+#endif
+
+		bool ok = PartitionManager.Flash_Image(flash_path, flash_filename);
 		if (ok) {
 			PartitionManager.Override_Active_Slot(current_slot == "A" ? "B" : "A");
-			ok = PartitionManager.Flash_Image(tmp_path, tmp_filename);
+			ok = PartitionManager.Flash_Image(flash_path, flash_filename);
 			PartitionManager.Override_Active_Slot(current_slot);
 		}
+		if (flash_filename != tmp_filename)
+			unlink((flash_path + "/" + flash_filename).c_str());
 
 		// leave the cached image in /tmp (tmpfs) - it clears itself on reboot,
 		// and staying there lets a repeat "Flash Current OrangeFox" reuse it too
