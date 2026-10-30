@@ -23,37 +23,42 @@
 #include <cstdint>
 #include <string>
 
-// Utilities to rebuild a vendor_boot v4 image by combining the PLATFORM
-// ramdisk of a stock ROM image with the RECOVERY ramdisk fragment and the DTB
-// of an OrangeFox image. Used by "Flash current OrangeFox" so that recovery
-// always runs against the kernel modules and DTB matching the installed ROM.
+// Rebuilds vendor_boot v4 images by combining a stock ROM PLATFORM ramdisk with
+// an OrangeFox RECOVERY ramdisk and DTB.
 namespace vbm {
 
-// Returns the size of a block device in bytes, or the size of a regular file.
-// Returns 0 when the size cannot be determined.
 uint64_t Get_Image_Size(const std::string& path);
 
-// True when both paths hold the same bytes. Used to detect that the live
-// vendor_boot partition still holds the image that was cached at boot, in
-// which case there is nothing to merge.
 bool Same_Image(const std::string& first, const std::string& second);
 
-// True when "path" starts with a vendor_boot v4 header.
 bool Is_Vendor_Boot_V4(const std::string& path);
 
-// Builds "output_image" from:
-//   - every non-RECOVERY ramdisk entry (and the header fields) of stock_image;
-//     lz4 PLATFORM ramdisks are unpacked, stripped of the files that OrangeFox
-//     ships in its own RECOVERY fragment, and compressed again
-//   - the RECOVERY ramdisk entry of orangefox_image
-//   - the DTB of orangefox_image
-// The result is padded with zeroes up to pad_to_size bytes (pass 0 to skip),
-// which also wipes any stale AVB footer left over on the partition.
+// Pads to pad_to_size bytes (0 to skip), wiping any stale AVB footer.
 bool Merge_Vendor_Boot(const std::string& stock_image,
                        const std::string& orangefox_image,
                        const std::string& output_image,
                        uint64_t pad_to_size,
                        std::string& error);
+
+bool Extract_Recovery_Ramdisk(const std::string& image,
+                              const std::string& output_path,
+                              std::string& error);
+
+bool Extract_Dtb(const std::string& image, const std::string& output_path,
+                 std::string& error);
+
+bool Same_Recovery_Ramdisk(const std::string& image,
+                           const std::string& recovery_ramdisk);
+
+bool Same_Dtb(const std::string& image, const std::string& dtb_file);
+
+// Replaces the RECOVERY ramdisk and DTB in base_image.
+bool Inject_Recovery_Ramdisk(const std::string& base_image,
+                             const std::string& recovery_ramdisk,
+                             const std::string& dtb_file,
+                             const std::string& output_image,
+                             uint64_t pad_to_size,
+                             std::string& error);
 
 }  // namespace vbm
 

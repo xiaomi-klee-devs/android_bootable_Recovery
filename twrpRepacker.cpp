@@ -32,6 +32,28 @@
 #include "vendor_boot_merge.hpp"
 #include "gui/gui.hpp"
 
+// Only the RECOVERY ramdisk and the (modified) DTB are cached. The DTB must
+// always be the OrangeFox one.
+static const char* kCachedRecoveryRamdisk = "/tmp/vendor_ramdisk01.cpio";
+static const char* kCachedDtb = "/tmp/vendor_boot.dtb";
+
+static std::string Vendor_Boot_Device_Path(const std::string& suffix) {
+	std::string path = "/dev/block/by-name/vendor_boot";
+	if (!suffix.empty())
+		path += suffix;
+	return path;
+}
+
+// A slot matches OrangeFox only when both cached fragments are identical.
+static bool Slot_Is_Cached_OrangeFox(const std::string& device) {
+	if (device.empty() || !TWFunc::Path_Exists(device))
+		return false;
+	if (!TWFunc::Path_Exists(kCachedRecoveryRamdisk) || !TWFunc::Path_Exists(kCachedDtb))
+		return false;
+	return vbm::Same_Recovery_Ramdisk(device, kCachedRecoveryRamdisk) &&
+	       vbm::Same_Dtb(device, kCachedDtb);
+}
+
 bool twrpRepacker::Prepare_Empty_Folder(const std::string& Folder) {
 	if (TWFunc::Path_Exists(Folder))
 		TWFunc::removeDir(Folder, false);
@@ -324,10 +346,8 @@ bool twrpRepacker::Repack_Image_And_Flash(const std::string& Target_Image, const
 	return true;
 }
 
-// Extracts the recovery/vendor_boot image of the currently active slot into /tmp.
-// Meant to be called once, very early at boot (right after the fstab/partitions are
-// set up), so that a later "Flash Current OrangeFox" doesn't need to dd the partition
-// again - it can just reuse the file that's already sitting in /tmp.
+// Caches the active slot's recovery data in /tmp for Flash Current OrangeFox.
+// v4 keeps only the RECOVERY ramdisk and DTB and aborts on failure.
 bool twrpRepacker::Cache_Current_Image() {
 #ifndef OF_RECOVERY_AB_FULL_REFLASH_RAMDISK
 	std::string slot = android::base::GetProperty("ro.boot.slot_suffix", "");
@@ -344,6 +364,25 @@ bool twrpRepacker::Cache_Current_Image() {
 
 	std::string root = "/dev/block/by-name" + dest_partition;
 	std::string src = (slot == "_a" || slot == "a") ? (root + "_a") : (root + "_b");
+
+#if defined(BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT) || defined(FOX_VENDOR_BOOT_RECOVERY)
+	if (dest_partition == "/vendor_boot" && vbm::Is_Vendor_Boot_V4(src)) {
+		std::string ramdisk_error, dtb_error;
+		if (!vbm::Extract_Recovery_Ramdisk(src, kCachedRecoveryRamdisk, ramdisk_error)) {
+			LOGERR("Could not extract the RECOVERY ramdisk from '%s': %s\nAborting the vendor_boot cache\n", src.c_str(), ramdisk_error.c_str());
+			unlink(kCachedRecoveryRamdisk);
+			return false;
+		}
+		if (!vbm::Extract_Dtb(src, kCachedDtb, dtb_error)) {
+			LOGERR("Could not extract the DTB from '%s': %s\nAborting the vendor_boot cache\n", src.c_str(), dtb_error.c_str());
+			unlink(kCachedRecoveryRamdisk);
+			unlink(kCachedDtb);
+			return false;
+		}
+		LOGINFO("Cached the OrangeFox RECOVERY ramdisk at '%s' and DTB at '%s'\n", kCachedRecoveryRamdisk, kCachedDtb);
+		return true;
+	}
+#endif
 
 	std::string tmp_filename = dest_partition.substr(1) + ".img"; // "vendor_boot.img" / "recovery.img"
 	std::string tmp_full = "/tmp/" + tmp_filename;
@@ -386,67 +425,162 @@ bool twrpRepacker::Flash_Current_Twrp() {
 		std::string tmp_path = "/tmp";
 		std::string tmp_filename = dest_partition.substr(1) + ".img"; // e.g. "vendor_boot.img" / "recovery.img"
 		std::string tmp_full = tmp_path + "/" + tmp_filename;
+		std::string flash_filename;
+		bool remove_after_flash = false;
 
-		if (TWFunc::Path_Exists(tmp_full)) {
-			// already cached at boot - no need to dd it again
-			LOGINFO("Reusing cached image already at '%s'\n", tmp_full.c_str());
-		} else {
-			// fallback: cache wasn't there for some reason, extract it now,
-			// same as a user manually picking an image file from /sdcard to flash
-			std::string command = "dd bs=1048576 if=" + src + " of=" + tmp_full;
-			LOGINFO("Command=%s\n", command.c_str());
-			if (TWFunc::Exec_Cmd(command) != 0) {
-				LOGERR("Failed to extract the current %s image to '%s'\n\n", dest_partition.c_str(), tmp_full.c_str());
+#if defined(BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT) || defined(FOX_VENDOR_BOOT_RECOVERY)
+		// v4: RECOVERY ramdisk and DTB come from the cache; only the PLATFORM
+		// ramdisk comes from the flashed ROM vendor_boot.
+		if (dest_partition == "/vendor_boot" &&
+		    TWFunc::Path_Exists(kCachedRecoveryRamdisk) &&
+		    TWFunc::Path_Exists(kCachedDtb)) {
+			std::string current_suffix = slot;
+			if (current_suffix == "a" || current_suffix == "A")
+				current_suffix = "_a";
+			else if (current_suffix == "b" || current_suffix == "B")
+				current_suffix = "_b";
+			else if (current_suffix != "_a" && current_suffix != "_b")
+				current_suffix.clear();
+
+			std::string other_suffix;
+			if (current_suffix == "_a")
+				other_suffix = "_b";
+			else if (current_suffix == "_b")
+				other_suffix = "_a";
+
+			if (current_suffix.empty() || other_suffix.empty()) {
+				LOGERR("Cannot determine both vendor_boot slots; aborting\n");
 				return false;
 			}
-		}
 
-		// now flash that image the same way the GUI does with "flash to both slots" checked:
-		// flash to the currently active slot, override to the other slot, flash again, then restore the slot
-		DataManager::SetValue("tw_flash_partition", dest_partition + ";");
-		std::string current_slot = PartitionManager.Get_Active_Slot_Display();
-
-		std::string flash_path = tmp_path;
-		std::string flash_filename = tmp_filename;
-#if defined(BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT) || defined(FOX_VENDOR_BOOT_RECOVERY)
-		// If the user flashed the vendor_boot image of their ROM over the OrangeFox one,
-		// rebuild a complete image: the PLATFORM ramdisk of that ROM, plus the RECOVERY
-		// ramdisk fragment and DTB of the OrangeFox image cached at boot.
-		if (dest_partition == "/vendor_boot" && !vbm::Same_Image(src, tmp_full)) {
-			std::string merged_filename = dest_partition.substr(1) + "-merged.img";
-			std::string merged_full = tmp_path + "/" + merged_filename;
-			std::string merge_error;
-			uint64_t partition_size = vbm::Get_Image_Size(src);
-			LOGINFO("Merging the ROM platform ramdisk from '%s' with the cached image '%s'\n", src.c_str(), tmp_full.c_str());
-			if (vbm::Merge_Vendor_Boot(src, tmp_full, merged_full, partition_size, merge_error)) {
-				LOGINFO("Built the merged vendor_boot image at '%s'\n", merged_full.c_str());
-				gui_print("Merged the installed ROM vendor_boot with OrangeFox\n\n");
-				flash_path = tmp_path;
-				flash_filename = merged_filename;
-			} else {
-				LOGERR("Could not merge the installed ROM vendor_boot image: %s\n", merge_error.c_str());
-				gui_print("Could not merge the installed ROM vendor_boot image\nFalling back to the cached OrangeFox image\n\n");
+			std::string current_dev = Vendor_Boot_Device_Path(current_suffix);
+			std::string other_dev = Vendor_Boot_Device_Path(other_suffix);
+			if (!TWFunc::Path_Exists(current_dev) || !TWFunc::Path_Exists(other_dev)) {
+				LOGERR("Cannot find '%s' or '%s'; aborting\n", current_dev.c_str(), other_dev.c_str());
+				return false;
 			}
+			if (!vbm::Is_Vendor_Boot_V4(current_dev) || !vbm::Is_Vendor_Boot_V4(other_dev)) {
+				LOGERR("'%s' or '%s' is not a valid vendor_boot v4 image; aborting\n",
+				        current_dev.c_str(), other_dev.c_str());
+				return false;
+			}
+
+			bool current_is_ofox = Slot_Is_Cached_OrangeFox(current_dev);
+			bool other_is_ofox = Slot_Is_Cached_OrangeFox(other_dev);
+
+			// Use the slot that no longer matches OrangeFox, else the current.
+			std::string base_dev;
+			if (!current_is_ofox)
+				base_dev = current_dev;
+			else if (!other_is_ofox)
+				base_dev = other_dev;
+			else
+				base_dev = current_dev;
+			bool base_is_ofox = (base_dev == current_dev) ? current_is_ofox : other_is_ofox;
+
+			LOGINFO("Flash Current OrangeFox: current=%s (ofox=%d), other=%s (ofox=%d), base=%s\n",
+			        current_dev.c_str(), current_is_ofox, other_dev.c_str(), other_is_ofox, base_dev.c_str());
+
+			if (!vbm::Is_Vendor_Boot_V4(base_dev)) {
+				LOGERR("The vendor_boot in '%s' is not a valid v4 image; refusing to rebuild\n", base_dev.c_str());
+				return false;
+			}
+
+			if (base_is_ofox) {
+				// Still OrangeFox: flash it as-is.
+				std::string command = "dd bs=1048576 if=" + base_dev + " of=" + tmp_full;
+				LOGINFO("Command=%s\n", command.c_str());
+				if (TWFunc::Exec_Cmd(command) != 0) {
+					LOGERR("Failed to extract '%s' to '%s'\n\n", base_dev.c_str(), tmp_full.c_str());
+					return false;
+				}
+				flash_filename = tmp_filename;
+				remove_after_flash = true;
+			} else {
+				std::string merged_filename = dest_partition.substr(1) + "-merged.img";
+				std::string merged_full = tmp_path + "/" + merged_filename;
+				std::string merge_error;
+				uint64_t partition_size = vbm::Get_Image_Size(base_dev);
+				if (partition_size == 0) {
+					LOGERR("Cannot determine the size of '%s'; aborting\n", base_dev.c_str());
+					return false;
+				}
+				LOGINFO("Rebuilding '%s' with the cached OrangeFox ramdisk and DTB\n", base_dev.c_str());
+				if (!vbm::Inject_Recovery_Ramdisk(base_dev, kCachedRecoveryRamdisk, kCachedDtb,
+				                                  merged_full, partition_size, merge_error)) {
+					LOGERR("Could not rebuild the vendor_boot image: %s\n", merge_error.c_str());
+					return false;
+				}
+				// The rebuilt image must carry the cached ramdisk and DTB.
+				if (!vbm::Same_Recovery_Ramdisk(merged_full, kCachedRecoveryRamdisk) ||
+				    !vbm::Same_Dtb(merged_full, kCachedDtb)) {
+					LOGERR("Verification of the rebuilt vendor_boot image failed; refusing to flash\n");
+					unlink(merged_full.c_str());
+					return false;
+				}
+				LOGINFO("Built and verified the merged vendor_boot image at '%s'\n", merged_full.c_str());
+				gui_print("Merged the installed ROM vendor_boot with OrangeFox\n\n");
+				flash_filename = merged_filename;
+				remove_after_flash = true;
+			}
+		} else if (dest_partition == "/vendor_boot" && vbm::Is_Vendor_Boot_V4(src)) {
+			// Missing cache on v4: abort, never reuse the ROM DTB.
+			LOGERR("The OrangeFox recovery ramdisk/DTB cache is missing; refusing to rebuild the vendor_boot image\n");
+			return false;
 		}
 #endif
 
-		bool ok = PartitionManager.Flash_Image(flash_path, flash_filename);
+		if (flash_filename.empty()) {
+			// Dedicated recovery partition or vendor_boot v3.
+			if (TWFunc::Path_Exists(tmp_full)) {
+				LOGINFO("Reusing cached image already at '%s'\n", tmp_full.c_str());
+			} else {
+				std::string command = "dd bs=1048576 if=" + src + " of=" + tmp_full;
+				LOGINFO("Command=%s\n", command.c_str());
+				if (TWFunc::Exec_Cmd(command) != 0) {
+					LOGERR("Failed to extract the current %s image to '%s'\n\n", dest_partition.c_str(), tmp_full.c_str());
+					return false;
+				}
+			}
+			flash_filename = tmp_filename;
+		}
+
+		// Flash the same image the way the GUI does with "flash to both slots" checked:
+		// flash to the currently active slot, override to the other slot, flash again, then restore the slot.
+		DataManager::SetValue("tw_flash_partition", dest_partition + ";");
+		std::string current_slot = PartitionManager.Get_Active_Slot_Display();
+
+		bool ok = PartitionManager.Flash_Image(tmp_path, flash_filename);
 		if (ok) {
 			PartitionManager.Override_Active_Slot(current_slot == "A" ? "B" : "A");
-			ok = PartitionManager.Flash_Image(flash_path, flash_filename);
+			ok = PartitionManager.Flash_Image(tmp_path, flash_filename);
 			PartitionManager.Override_Active_Slot(current_slot);
 		}
-		if (flash_filename != tmp_filename)
-			unlink((flash_path + "/" + flash_filename).c_str());
 
-		// leave the cached image in /tmp (tmpfs) - it clears itself on reboot,
-		// and staying there lets a repeat "Flash Current OrangeFox" reuse it too
+		if (remove_after_flash)
+			unlink((tmp_path + "/" + flash_filename).c_str());
+
+		// The cache lives in /tmp (tmpfs) and clears on reboot.
 		if (!ok) {
 			LOGERR("Failed to flash the %s image to both slots\n\n", dest_partition.c_str());
 			return false;
 		}
 		gui_print("Finished flashing the %s image to both slots\n\n", dest_partition.c_str());
 		return true;
+	}
+#endif
+
+#ifndef OF_RECOVERY_AB_FULL_REFLASH_RAMDISK
+	if (dest_partition == "/vendor_boot") {
+		std::string guard_suffix;
+		if (slot == "_a" || slot == "a" || slot == "A")
+			guard_suffix = "_a";
+		else if (slot == "_b" || slot == "b" || slot == "B")
+			guard_suffix = "_b";
+		if (vbm::Is_Vendor_Boot_V4(Vendor_Boot_Device_Path(guard_suffix))) {
+			LOGERR("Cannot safely rebuild a v4 vendor_boot outside the slot/cache checks; aborting\n");
+			return false;
+		}
 	}
 #endif
 

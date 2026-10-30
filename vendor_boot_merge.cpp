@@ -48,17 +48,13 @@ constexpr uint32_t kTypePlatform = 1;
 constexpr uint32_t kTypeRecovery = 2;
 constexpr size_t kCopyBufferSize = 1024 * 1024;
 
-// Legacy lz4 stream ("lz4 -l"), the format used by Android ramdisks: a 4-byte
-// magic followed by blocks of "4-byte little-endian compressed size + data",
-// each block decompressing to at most 8 MiB.
+// Legacy lz4 stream ("lz4 -l"): magic + blocks of 4-byte size + data.
 constexpr uint32_t kLz4LegacyMagic = 0x184C2102;
 constexpr int kLz4LegacyBlockSize = 8 * 1024 * 1024;
 constexpr int kLz4CompressionLevel = 12;
 
-// Files/directories that the OrangeFox build removes from the stock PLATFORM
-// ramdisk (see tools/build-system-compatible-vendor-boot.sh). The recovery
-// ramdisk fragment ships its own copies, so keeping the ROM ones would only
-// waste space and can shadow the OrangeFox versions depending on merge order.
+// Paths removed from the stock PLATFORM ramdisk; the RECOVERY fragment ships
+// its own copies.
 constexpr const char* kPrunedPaths[] = {
 	"miui.factoryreset.rc",
 	"system/bin/adbd",
@@ -304,6 +300,11 @@ bool Image::Read(uint64_t offset, void* buffer, size_t length, std::string& erro
 	return true;
 }
 
+bool Is_Recovery_Entry(const Table_Entry& entry) {
+	return entry.type == kTypeRecovery ||
+	       strncmp(entry.name, "recovery", kRamdiskNameSize) == 0;
+}
+
 const Table_Entry* Find_Recovery_Entry(const Image& image) {
 	for (const auto& entry : image.entries) {
 		if (strncmp(entry.name, "recovery", kRamdiskNameSize) == 0)
@@ -434,6 +435,7 @@ std::string Normalize_Cpio_Path(std::string name) {
 	return name;
 }
 
+// Absent paths are ignored, like rm -rf.
 bool Is_Pruned_Cpio_Path(const std::string& name) {
 	if (name == "res" || name.compare(0, 4, "res/") == 0)
 		return true;
@@ -444,10 +446,8 @@ bool Is_Pruned_Cpio_Path(const std::string& name) {
 	return false;
 }
 
-// Copies a newc/crc cpio archive while dropping the files that the OrangeFox
-// build also removes from the stock PLATFORM ramdisk. Entries are copied
-// verbatim, so permissions, symlinks, inode numbers and SELinux xattrs are all
-// preserved and there is no need to regenerate cpio headers.
+// Drops the pruned paths from a newc/crc archive, copying all other entries
+// verbatim. Only a malformed archive is an error.
 bool Prune_Cpio(const std::vector<uint8_t>& input, std::vector<uint8_t>& output,
                 std::string& error) {
 	output.clear();
@@ -601,10 +601,7 @@ bool Compress_Lz4_Legacy(const std::vector<uint8_t>& input,
 	return true;
 }
 
-// Decompresses a PLATFORM ramdisk, drops the files that OrangeFox ships in its
-// own RECOVERY fragment, and compresses the result again. Recompressing at the
-// same high level as the build is what keeps the merged image inside the
-// vendor_boot partition even when the ROM used a fast lz4 level.
+// Rebuilds the PLATFORM ramdisk without the files also shipped by OrangeFox.
 bool Build_Pruned_Platform(const Image& source, const Table_Entry& entry,
                            std::vector<uint8_t>& output, std::string& error) {
 	std::vector<uint8_t> cpio;
@@ -613,8 +610,6 @@ bool Build_Pruned_Platform(const Image& source, const Table_Entry& entry,
 	std::vector<uint8_t> pruned;
 	if (!Prune_Cpio(cpio, pruned, error))
 		return false;
-	// The uncompressed source is no longer needed; release it before
-	// compressing so recovery does not have to keep two large buffers.
 	std::vector<uint8_t>().swap(cpio);
 	return Compress_Lz4_Legacy(pruned, output, error);
 }
@@ -625,6 +620,7 @@ struct Output_Entry {
 	uint64_t source_offset = 0;
 	bool use_blob = false;
 	std::vector<uint8_t> blob;
+	std::string file_path;  // when not empty, stream the blob from this file
 };
 
 bool Write_Header(int fd, const Header& header, uint32_t page_size, std::string& error) {
@@ -731,6 +727,30 @@ bool Is_Vendor_Boot_V4(const std::string& path) {
 	return image.Open(path, error);
 }
 
+bool Copy_File_To_Output(const std::string& path, uint64_t length, int output_fd,
+                         std::string& error) {
+	int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		error = "cannot open " + path + ": " + strerror(errno);
+		return false;
+	}
+	bool ok = Copy_Data(fd, path, 0, length, output_fd, error);
+	close(fd);
+	return ok;
+}
+
+// DTB source: a separate file, or the DTB section of image.
+struct Dtb_Source {
+	const Image* image = nullptr;
+	std::string file_path;
+	uint32_t size = 0;
+};
+
+bool Build_Vendor_Boot(const Image& stock, const Dtb_Source& dtb,
+                       std::vector<Output_Entry> output_entries,
+                       uint64_t pad_to_size, const std::string& output_image,
+                       std::string& error);
+
 bool Merge_Vendor_Boot(const std::string& stock_image,
                        const std::string& orangefox_image,
                        const std::string& output_image,
@@ -755,25 +775,27 @@ bool Merge_Vendor_Boot(const std::string& stock_image,
 
 	std::vector<Output_Entry> output_entries;
 	for (const auto& entry : stock.entries) {
-		if (entry.type == kTypeRecovery)
+		if (Is_Recovery_Entry(entry))
 			continue;
 		Output_Entry output;
 		output.image = &stock;
 		output.entry = entry;
-		// Offsets in the table are relative to the start of the ramdisk area,
-		// so they are rebuilt while the merged blobs are written.
+		// Table offsets are relative to the ramdisk area.
 		output.source_offset = stock.Ramdisk_Base() + entry.offset;
 		if (entry.type == kTypePlatform && Has_Lz4_Legacy_Magic(stock, entry)) {
 			std::string prune_error;
 			std::vector<uint8_t> blob;
-			// Older/third-party images might have a platform ramdisk that is
-			// not valid cpio; copy it verbatim in that case.
-			if (Build_Pruned_Platform(stock, entry, blob, prune_error) &&
-			    blob.size() <= UINT32_MAX) {
-				output.entry.size = static_cast<uint32_t>(blob.size());
-				output.blob = std::move(blob);
-				output.use_blob = true;
+			if (!Build_Pruned_Platform(stock, entry, blob, prune_error)) {
+				error = "cannot rebuild the PLATFORM ramdisk: " + prune_error;
+				return false;
 			}
+			if (blob.size() > UINT32_MAX) {
+				error = "the rebuilt PLATFORM ramdisk is too large";
+				return false;
+			}
+			output.entry.size = static_cast<uint32_t>(blob.size());
+			output.blob = std::move(blob);
+			output.use_blob = true;
 		}
 		output_entries.push_back(std::move(output));
 	}
@@ -784,15 +806,32 @@ bool Merge_Vendor_Boot(const std::string& stock_image,
 	    orangefox.Ramdisk_Base() + recovery->offset;
 	output_entries.push_back(std::move(recovery_output));
 
+	Dtb_Source dtb;
+	dtb.image = &orangefox;
+	return Build_Vendor_Boot(stock, dtb, std::move(output_entries),
+	                         pad_to_size, output_image, error);
+}
+
+bool Build_Vendor_Boot(const Image& stock, const Dtb_Source& dtb,
+                       std::vector<Output_Entry> output_entries,
+                       uint64_t pad_to_size, const std::string& output_image,
+                       std::string& error) {
+	if (output_entries.empty()) {
+		error = "no vendor ramdisk entries to write";
+		return false;
+	}
 	if (output_entries.size() > UINT32_MAX / kTableEntrySize) {
 		error = "too many vendor ramdisk entries";
 		return false;
 	}
 
+	uint32_t dtb_size = !dtb.file_path.empty()
+	                        ? dtb.size
+	                        : (dtb.image != nullptr ? dtb.image->header.dtb_size : 0);
 	Header header = stock.header;
-	header.dtb_size = orangefox.header.dtb_size;
-	if (header.dtb_addr == 0)
-		header.dtb_addr = orangefox.header.dtb_addr;
+	header.dtb_size = dtb_size;
+	if (header.dtb_addr == 0 && dtb.image != nullptr && dtb.file_path.empty())
+		header.dtb_addr = dtb.image->header.dtb_addr;
 	header.table_entries = static_cast<uint32_t>(output_entries.size());
 	header.table_entry_size = kTableEntrySize;
 	header.table_size = header.table_entries * kTableEntrySize;
@@ -804,8 +843,7 @@ bool Merge_Vendor_Boot(const std::string& stock_image,
 		return false;
 	}
 
-	// The header is written last, once the merged blob sizes are known, so
-	// reserve its space here.
+	// Header is written last, once blob sizes are known.
 	uint64_t header_pages = (header.header_size + header.page_size - 1) / header.page_size;
 	uint64_t header_size = static_cast<uint64_t>(header_pages) * header.page_size;
 	bool ok = ftruncate(output_fd, static_cast<off_t>(header_size)) == 0 &&
@@ -830,10 +868,16 @@ bool Merge_Vendor_Boot(const std::string& stock_image,
 			ok = Write_All(output_fd, entry.blob.data(), entry.blob.size(), error);
 			if (ok)
 				entry.entry.size = static_cast<uint32_t>(written);
-		} else {
+		} else if (!entry.file_path.empty()) {
+			written = source_entry.size;
+			ok = Copy_File_To_Output(entry.file_path, written, output_fd, error);
+		} else if (entry.image != nullptr) {
 			ok = Copy_Data(entry.image->fd, entry.image->path, entry.source_offset,
 			               source_entry.size, output_fd, error);
 			written = source_entry.size;
+		} else {
+			error = "vendor ramdisk entry has no source";
+			ok = false;
 		}
 		ramdisk_size += written;
 	}
@@ -845,9 +889,15 @@ bool Merge_Vendor_Boot(const std::string& stock_image,
 		header.vendor_ramdisk_size = static_cast<uint32_t>(ramdisk_size);
 		ok = Pad_To_Page(output_fd, header.page_size, error);
 	}
-	if (ok)
-		ok = Copy_Data(orangefox.fd, orangefox.path, orangefox.Dtb_Offset(),
-		               orangefox.header.dtb_size, output_fd, error);
+	if (ok && dtb_size > 0) {
+		if (!dtb.file_path.empty())
+			ok = Copy_File_To_Output(dtb.file_path, dtb.size, output_fd, error);
+		else if (dtb.image != nullptr)
+			ok = Copy_Data(dtb.image->fd, dtb.image->path, dtb.image->Dtb_Offset(),
+			               dtb.image->header.dtb_size, output_fd, error);
+		else
+			ok = false;
+	}
 	if (ok)
 		ok = Pad_To_Page(output_fd, header.page_size, error);
 	if (ok) {
@@ -910,6 +960,267 @@ bool Merge_Vendor_Boot(const std::string& stock_image,
 	if (!ok)
 		unlink(output_image.c_str());
 	return ok;
+}
+
+bool Extract_Recovery_Ramdisk(const std::string& image,
+                              const std::string& output_path,
+                              std::string& error) {
+	Image source;
+	if (!source.Open(image, error))
+		return false;
+
+	const Table_Entry* recovery = Find_Recovery_Entry(source);
+	if (recovery == nullptr) {
+		error = "the image has no RECOVERY ramdisk fragment";
+		return false;
+	}
+
+	int output_fd = open(output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (output_fd < 0) {
+		error = "cannot create " + output_path + ": " + strerror(errno);
+		return false;
+	}
+
+	bool ok = Copy_Data(source.fd, source.path,
+	                    source.Ramdisk_Base() + recovery->offset, recovery->size,
+	                    output_fd, error);
+	if (ok && fsync(output_fd) != 0) {
+		error = "failed to flush " + output_path + ": " + strerror(errno);
+		ok = false;
+	}
+	if (close(output_fd) != 0 && ok) {
+		error = "failed to close " + output_path + ": " + strerror(errno);
+		ok = false;
+	}
+	if (!ok)
+		unlink(output_path.c_str());
+	return ok;
+}
+
+bool Extract_Dtb(const std::string& image, const std::string& output_path,
+                 std::string& error) {
+	Image source;
+	if (!source.Open(image, error))
+		return false;
+
+	if (source.header.dtb_size == 0) {
+		error = "the image has no DTB";
+		return false;
+	}
+
+	int output_fd = open(output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (output_fd < 0) {
+		error = "cannot create " + output_path + ": " + strerror(errno);
+		return false;
+	}
+
+	bool ok = Copy_Data(source.fd, source.path, source.Dtb_Offset(),
+	                    source.header.dtb_size, output_fd, error);
+	if (ok && fsync(output_fd) != 0) {
+		error = "failed to flush " + output_path + ": " + strerror(errno);
+		ok = false;
+	}
+	if (close(output_fd) != 0 && ok) {
+		error = "failed to close " + output_path + ": " + strerror(errno);
+		ok = false;
+	}
+	if (!ok)
+		unlink(output_path.c_str());
+	return ok;
+}
+
+bool Same_Recovery_Ramdisk(const std::string& image,
+                           const std::string& recovery_ramdisk) {
+	Image source;
+	std::string error;
+	if (!source.Open(image, error))
+		return false;
+
+	const Table_Entry* recovery = Find_Recovery_Entry(source);
+	if (recovery == nullptr)
+		return false;
+
+	int fd = open(recovery_ramdisk.c_str(), O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return false;
+
+	struct stat info {};
+	if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+	    static_cast<uint64_t>(info.st_size) != recovery->size) {
+		close(fd);
+		return false;
+	}
+
+	std::vector<uint8_t> image_buffer(kCopyBufferSize);
+	std::vector<uint8_t> file_buffer(kCopyBufferSize);
+	uint64_t compared = 0;
+	bool same = true;
+	while (same && compared < recovery->size) {
+		size_t chunk = static_cast<size_t>(
+		    std::min<uint64_t>(kCopyBufferSize, recovery->size - compared));
+		if (!source.Read(source.Ramdisk_Base() + recovery->offset + compared,
+		                 image_buffer.data(), chunk, error)) {
+			same = false;
+			break;
+		}
+		size_t done = 0;
+		while (same && done < chunk) {
+			ssize_t result = read(fd, file_buffer.data() + done, chunk - done);
+			if (result < 0) {
+				if (errno == EINTR) continue;
+				same = false;
+				break;
+			}
+			if (result == 0) {
+				same = false;
+				break;
+			}
+			done += static_cast<size_t>(result);
+		}
+		if (same && memcmp(image_buffer.data(), file_buffer.data(), chunk) != 0)
+			same = false;
+		compared += chunk;
+	}
+
+	close(fd);
+	return same;
+}
+
+bool Same_Dtb(const std::string& image, const std::string& dtb_file) {
+	Image source;
+	std::string error;
+	if (!source.Open(image, error))
+		return false;
+
+	if (source.header.dtb_size == 0)
+		return false;
+
+	int fd = open(dtb_file.c_str(), O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return false;
+
+	struct stat info {};
+	if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+	    static_cast<uint64_t>(info.st_size) != source.header.dtb_size) {
+		close(fd);
+		return false;
+	}
+
+	std::vector<uint8_t> image_buffer(kCopyBufferSize);
+	std::vector<uint8_t> file_buffer(kCopyBufferSize);
+	uint64_t compared = 0;
+	bool same = true;
+	while (same && compared < source.header.dtb_size) {
+		size_t chunk = static_cast<size_t>(std::min<uint64_t>(
+		    kCopyBufferSize, source.header.dtb_size - compared));
+		if (!source.Read(source.Dtb_Offset() + compared, image_buffer.data(),
+		                 chunk, error)) {
+			same = false;
+			break;
+		}
+		size_t done = 0;
+		while (same && done < chunk) {
+			ssize_t result = read(fd, file_buffer.data() + done, chunk - done);
+			if (result < 0) {
+				if (errno == EINTR) continue;
+				same = false;
+				break;
+			}
+			if (result == 0) {
+				same = false;
+				break;
+			}
+			done += static_cast<size_t>(result);
+		}
+		if (same && memcmp(image_buffer.data(), file_buffer.data(), chunk) != 0)
+			same = false;
+		compared += chunk;
+	}
+
+	close(fd);
+	return same;
+}
+
+bool Inject_Recovery_Ramdisk(const std::string& base_image,
+                             const std::string& recovery_ramdisk,
+                             const std::string& dtb_file,
+                             const std::string& output_image,
+                             uint64_t pad_to_size,
+                             std::string& error) {
+	Image base;
+	if (!base.Open(base_image, error))
+		return false;
+
+	struct stat info {};
+	if (stat(recovery_ramdisk.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) {
+		error = "cannot read " + recovery_ramdisk + ": " + strerror(errno);
+		return false;
+	}
+	if (info.st_size <= 0 || static_cast<uint64_t>(info.st_size) > UINT32_MAX) {
+		error = "invalid recovery ramdisk size for " + recovery_ramdisk;
+		return false;
+	}
+
+	if (dtb_file.empty()) {
+		error = "no DTB was provided for the rebuilt image";
+		return false;
+	}
+	Dtb_Source dtb;
+	struct stat dtb_info {};
+	if (stat(dtb_file.c_str(), &dtb_info) != 0 || !S_ISREG(dtb_info.st_mode)) {
+		error = "cannot read " + dtb_file + ": " + strerror(errno);
+		return false;
+	}
+	if (dtb_info.st_size <= 0 ||
+	    static_cast<uint64_t>(dtb_info.st_size) > UINT32_MAX) {
+		error = "invalid DTB size for " + dtb_file;
+		return false;
+	}
+	dtb.file_path = dtb_file;
+	dtb.size = static_cast<uint32_t>(dtb_info.st_size);
+
+	const Table_Entry* existing = Find_Recovery_Entry(base);
+	std::vector<Output_Entry> output_entries;
+	for (const auto& entry : base.entries) {
+		if (Is_Recovery_Entry(entry))
+			continue;
+		Output_Entry output;
+		output.image = &base;
+		output.entry = entry;
+		output.source_offset = base.Ramdisk_Base() + entry.offset;
+		if (entry.type == kTypePlatform && Has_Lz4_Legacy_Magic(base, entry)) {
+			std::string prune_error;
+			std::vector<uint8_t> blob;
+			if (!Build_Pruned_Platform(base, entry, blob, prune_error)) {
+				error = "cannot rebuild the PLATFORM ramdisk: " + prune_error;
+				return false;
+			}
+			if (blob.size() > UINT32_MAX) {
+				error = "the rebuilt PLATFORM ramdisk is too large";
+				return false;
+			}
+			output.entry.size = static_cast<uint32_t>(blob.size());
+			output.blob = std::move(blob);
+			output.use_blob = true;
+		}
+		output_entries.push_back(std::move(output));
+	}
+
+	Output_Entry recovery_output;
+	recovery_output.file_path = recovery_ramdisk;
+	if (existing != nullptr) {
+		recovery_output.entry = *existing;
+		recovery_output.entry.type = kTypeRecovery;
+	} else {
+		recovery_output.entry.type = kTypeRecovery;
+	}
+	if (recovery_output.entry.name[0] == '\0')
+		memcpy(recovery_output.entry.name, "recovery", sizeof("recovery"));
+	recovery_output.entry.size = static_cast<uint32_t>(info.st_size);
+	output_entries.push_back(std::move(recovery_output));
+
+	return Build_Vendor_Boot(base, dtb, std::move(output_entries),
+	                         pad_to_size, output_image, error);
 }
 
 }  // namespace vbm
